@@ -127,10 +127,13 @@ def format_error(error: Exception) -> Panel:
 
     # Whole message, not just line one: an aggregate error's actionable
     # per-item detail lives below the headline. Bounded to stay readable.
-    text = str(error)
-    # ``__str__`` already appends the suggestion; the panel adds it below.
-    if isinstance(error, ConductorError) and error.suggestion:
-        text = text.split("\n\n💡 Suggestion: ")[0]
+    # For a ConductorError use the bare message: its ``__str__`` appends
+    # location / field / suggestion, all of which the panel renders itself
+    # below, so ``str(error)`` would print each of them twice.
+    if isinstance(error, ConductorError):
+        text = str(error.args[0]) if error.args else ""
+    else:
+        text = str(error)
     lines = text.split("\n")
     if len(lines) > _MAX_ERROR_LINES:
         omitted = len(lines) - _MAX_ERROR_LINES

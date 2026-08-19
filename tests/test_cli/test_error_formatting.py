@@ -25,6 +25,19 @@ def test_per_item_detail_is_shown() -> None:
     assert "registry preflight failed" in out
 
 
+def test_location_and_field_are_not_duplicated() -> None:
+    """``__str__`` appends location/field/suggestion; the panel renders each."""
+    from conductor.exceptions import ConfigurationError
+
+    out = _render(
+        ConfigurationError(
+            "bad", file_path="/tmp/wf.yaml", line_number=42, field_path="agents[0].tools"
+        )
+    )
+    assert out.count("Location") == 1
+    assert out.count("Field") == 1
+
+
 def test_suggestion_is_not_duplicated() -> None:
     """``ConductorError.__str__`` embeds the suggestion; the panel adds it too."""
     out = _render(ExecutionError("boom", suggestion="do the thing"))
