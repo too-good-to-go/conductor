@@ -221,17 +221,6 @@ _SKILL_TOOL: Final[str] = "Skill"
 # Conductor's ``<server>__<tool>`` is the CLI's ``mcp__<server>__<tool>``.
 _MCP_TOOL_PREFIX: Final[str] = "mcp__"
 
-# Denied alongside any allowlist: ``allowed_tools`` only pre-approves, so a
-# read-only MCP list is void if native Write/Bash stay open.
-_BUILTIN_WRITE_TOOLS: Final[tuple[str, ...]] = (
-    "Write",
-    "Edit",
-    "NotebookEdit",
-    "Bash",
-    "BashOutput",
-    "KillShell",
-)
-
 # Keys ``_translate_mcp_servers`` can carry onto the SDK's config shapes.
 # ``tools`` and ``timeout`` are handled explicitly above (refused / warned),
 # so they count as recognised even though they are not forwarded.
@@ -723,6 +712,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # directory, so one key under two directories is two sessions.
         # ``None`` = not yet enumerated; empty set is a valid result.
         self._enumerated_mcp_tools: set[str] | None = None
+        # Serialized: enumeration spawns every declared server.
+        self._enumerate_lock = asyncio.Lock()
         self._session_ids: dict[tuple[str, str], str] = {}
         self._resume_session_ids: dict[tuple[str, str], str] = {}
         # Slots currently executing, so a second execution cannot resume a
@@ -944,8 +935,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
         enumerated_mcp_tools: set[str] = set()
         server_denied: list[str] = []
         if tools or self._server_tool_filters:
-            enumerated_mcp_tools = await self._enumerate_mcp_tools()
+            plugin_servers = _translate_mcp_servers(extra_mcp_servers) if extra_mcp_servers else {}
+            enumerated_mcp_tools = await self._enumerate_mcp_tools(
+                {**self._mcp_servers, **plugin_servers} if plugin_servers else None
+            )
             server_denied = _server_filter_denials(enumerated_mcp_tools, self._server_tool_filters)
+
+        # Restores the MCP scope the CLI's Roots would otherwise collapse to cwd.
+        add_dirs = _stdio_path_args({**self._mcp_servers, **(extra_mcp_servers or {})})
 
         sdk_tools, permission_mode, allowed_tools, disallowed_tools = self._resolve_tool_config(
             tools,
@@ -973,8 +970,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so pass it through verbatim rather than re-resolving — that would
             # collapse the symlink aliases the engine preserves.
             cwd=resolved_cwd,
-            # MCP Roots override a server's own path args with cwd + these.
-            add_dirs=_stdio_path_args({**self._mcp_servers, **(extra_mcp_servers or {})}),
+            # MCP Roots collapse a server's own path args to cwd without these.
+            add_dirs=add_dirs,
             output_format=_build_output_format(agent.output) if agent.output else None,
             max_turns=max_turns,
             permission_mode=permission_mode,
@@ -1528,7 +1525,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             logger.debug("Session lookup failed for %s under %s", session_id, cwd, exc_info=True)
             return False
 
-    async def _enumerate_mcp_tools(self) -> set[str]:
+    async def _enumerate_mcp_tools(self, servers: dict[str, Any] | None = None) -> set[str]:
         """Enumerate every tool on the declared stdio MCP servers.
 
         Returns conductor-style ``<server>__<tool>`` names (``MCPManager``
@@ -1542,14 +1539,25 @@ class ClaudeAgentSdkProvider(AgentProvider):
             ProviderError: If a declared server is not stdio, or enumeration
                 fails. Both are non-retryable: neither becomes valid on retry.
         """
-        if self._enumerated_mcp_tools is not None:
+        # Plugin servers are not in ``self._mcp_servers``; pass them in or their
+        # tools go unenumerated and undeniable.
+        servers = self._mcp_servers if servers is None else servers
+        cacheable = servers is self._mcp_servers
+        if cacheable and self._enumerated_mcp_tools is not None:
             return self._enumerated_mcp_tools
+
+        async with self._enumerate_lock:
+            # Re-check: a concurrent caller may have populated it while we waited.
+            if cacheable and self._enumerated_mcp_tools is not None:
+                return self._enumerated_mcp_tools
+            return await self._enumerate_uncached(servers, cacheable=cacheable)
+
+    async def _enumerate_uncached(self, servers: dict[str, Any], *, cacheable: bool) -> set[str]:
+        """Enumerate ``servers``; caller holds :attr:`_enumerate_lock`."""
 
         from conductor.mcp.manager import MCPManager
 
-        non_stdio = sorted(
-            name for name, cfg in self._mcp_servers.items() if cfg.get("type") != "stdio"
-        )
+        non_stdio = sorted(name for name, cfg in servers.items() if cfg.get("type") != "stdio")
         if non_stdio:
             raise ProviderError(
                 f"Cannot enforce a per-agent 'tools:' allowlist: MCP server(s) "
@@ -1565,7 +1573,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         manager = MCPManager()
         names: set[str] = set()
         try:
-            for server_name, cfg in self._mcp_servers.items():
+            for server_name, cfg in servers.items():
                 tools = await manager.connect_server(
                     server_name,
                     cfg["command"],
@@ -1587,7 +1595,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
         finally:
             await manager.close()
 
-        self._enumerated_mcp_tools = names
+        if cacheable:
+            self._enumerated_mcp_tools = names
         return names
 
     @staticmethod
@@ -1627,11 +1636,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
           When skills are enabled, grant the ``Skill`` tool back: an empty
           base tool set would otherwise leave the declared skill unreachable,
           silently ignoring the ``skills:`` the workflow asked for.
-        * ``tools`` non-empty — raise ``ProviderError``. Workflow tool
-          name → CLI tool ID translation is not implemented (tracked as
-          a follow-up). Silently dropping the allowlist would be a
-          security regression; silently passing it through could grant
-          the wrong native tool. Refuse loudly.
+        * ``tools`` non-empty — honored. MCP entries are forwarded as
+          ``mcp__<server>__<tool>`` in ``allowed_tools`` and the enumerated
+          complement is denied; natively named entries become the SDK ``tools``
+          list, so every other built-in is removed by omission rather than by
+          an always-incomplete deny-list.
 
         Args:
             tools: The executor-resolved ``tools:`` allowlist for this agent.
@@ -1640,6 +1649,8 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 the error message.
             skills_enabled: Whether this agent has skills to load. Only
                 affects the explicit ``tools: []`` case.
+            enumerated_mcp_tools: Every ``<server>__<tool>`` the declared servers
+                expose, used to compute the complement to deny.
 
         Returns:
             A ``(sdk_tools, permission_mode, allowed_tools, disallowed_tools)``
@@ -1647,7 +1658,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
             unless the agent declares a non-empty allowlist.
 
         Raises:
-            ProviderError: If ``tools`` is a non-empty list.
+            ProviderError: If ``tools: []`` is set while plugins ship subagents.
         """
         if not tools:
             # The executor passes [] for BOTH "omitted (no workflow tools to
@@ -1697,13 +1708,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
             for name in (enumerated_mcp_tools or set())
             if name not in allowlisted
         )
-        denied_builtin = [name for name in _BUILTIN_WRITE_TOOLS if name not in native_tools]
-        # Preset stays: it is the base set the denial list filters.
+        # Built-ins removed by OMISSION, not denial: the set is host-dependent
+        # so a deny-list is always incomplete, and native ``Read`` ignores the
+        # MCP server's root entirely.
         return (
-            _DEFAULT_TOOL_PRESET,
+            native_tools,
             "bypassPermissions",
             allowed,
-            denied_mcp + denied_builtin,
+            denied_mcp,
         )
 
     @staticmethod

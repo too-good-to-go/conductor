@@ -662,8 +662,7 @@ class TestToolResolution:
             "mcp__filesystem__read_file",
             "mcp__youtrack__issue_details",
         ]
-        assert "Write" in opts.disallowed_tools
-        assert "Bash" in opts.disallowed_tools
+        assert opts.tools == []
 
 
 class TestOmittedToolsDefaultPreset:
@@ -765,7 +764,8 @@ class TestOmittedToolsDefaultPreset:
         assert "mcp__filesystem__read_file" in opts.allowed_tools
         assert "Bash" in opts.allowed_tools
         assert "Bash" not in opts.disallowed_tools
-        assert "Write" in opts.disallowed_tools
+        # Named natively, so it is the only built-in that survives.
+        assert opts.tools == ["Bash"]
 
     async def test_inherited_workflow_tools_honored(self) -> None:
         """An inherited workflow-level list is enforced like a declared one."""
@@ -788,7 +788,7 @@ class TestOmittedToolsDefaultPreset:
 
         opts = captured["options"]
         assert opts.allowed_tools == ["mcp__filesystem__read_file"]
-        assert "Write" in opts.disallowed_tools
+        assert opts.tools == []
 
     async def test_executor_to_provider_end_to_end_grants_preset(self) -> None:
         """End-to-end through AgentExecutor: an omitted ``tools:`` reaches the
@@ -2927,27 +2927,32 @@ class TestMcpAllowlistEnforcement:
         assert "mcp__filesystem__edit_file" in denied
         assert "mcp__filesystem__read_text_file" not in denied
 
-    def test_builtin_write_tools_are_denied_alongside(self) -> None:
-        """Denying MCP writers is pointless if native Write/Bash stay open."""
+    def test_builtins_are_removed_by_omission(self) -> None:
+        """A deny-list cannot cover the host-dependent built-in set.
+
+        Native ``Read`` reaches the whole filesystem regardless of an MCP
+        server's root, so the built-ins are dropped from ``tools`` entirely
+        rather than enumerated into ``disallowed_tools``.
+        """
         agent = AgentDef(name="judge", prompt="hi", tools=["filesystem__read_file"])
-        _t, _m, _allowed, denied = ClaudeAgentSdkProvider._resolve_tool_config(
+        sdk_tools, _m, _allowed, _denied = ClaudeAgentSdkProvider._resolve_tool_config(
             ["filesystem__read_file"],
             agent,
             skills_enabled=False,
             enumerated_mcp_tools={"filesystem__read_file"},
         )
-        assert "Write" in denied
-        assert "Bash" in denied
+        assert sdk_tools == []
 
     def test_natively_named_allowlist_entry_is_not_denied(self) -> None:
         """An agent that legitimately asks for Bash keeps it."""
         agent = AgentDef(name="impl", prompt="hi", tools=["Bash"])
-        _t, _m, allowed, denied = ClaudeAgentSdkProvider._resolve_tool_config(
+        sdk_tools, _m, allowed, denied = ClaudeAgentSdkProvider._resolve_tool_config(
             ["Bash"], agent, skills_enabled=False, enumerated_mcp_tools=set()
         )
         assert "Bash" in allowed
         assert "Bash" not in denied
-        assert "Write" in denied
+        # Named natively, so it survives in the SDK tool list; nothing else does.
+        assert sdk_tools == ["Bash"]
 
     async def test_http_server_with_allowlist_is_refused(self) -> None:
         """stdio-only enumeration: http/sse must raise, not under-enforce."""
@@ -3003,3 +3008,22 @@ class TestDialogTurn:
         assert captured["options"].tools == []
         assert captured["options"].setting_sources == []
         assert "earlier turn" in captured["prompt"]
+
+    async def test_plugin_http_server_is_refused(self) -> None:
+        """A per-agent plugin's servers must be enumerated too.
+
+        They are not in ``self._mcp_servers``, so scanning only that attribute
+        left a plugin's tools undeniable and its http/sse server past the guard.
+        """
+        provider = ClaudeAgentSdkProvider()
+        with pytest.raises(ProviderError, match="http/sse"):
+            await provider._enumerate_mcp_tools(
+                {"plug": {"type": "http", "url": "https://example.test/mcp"}}
+            )
+
+    async def test_plugin_servers_are_not_cached_as_the_workflow_set(self) -> None:
+        """Caching a per-agent set would leak one agent's plugins into another."""
+        provider = ClaudeAgentSdkProvider()
+        provider._enumerated_mcp_tools = {"docs__read"}
+        # Passing an explicit set bypasses the cache rather than overwriting it.
+        assert await provider._enumerate_mcp_tools() == {"docs__read"}
