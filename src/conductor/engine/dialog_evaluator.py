@@ -161,6 +161,17 @@ class DialogEvaluator:
                 ),
                 is_retryable=False,
             ) from exc
+        except ProviderError as exc:
+            # aca documents the limitation this way, not via NotImplementedError.
+            # Only a non-retryable refusal is fatal; transients stay fail-open.
+            if not exc.is_retryable:
+                raise
+            logger.warning(
+                "Dialog evaluation failed for agent '%s', skipping dialog",
+                agent.name,
+                exc_info=True,
+            )
+            return DialogEvaluation(trigger=False, reason="Evaluation failed")
         except Exception:
             logger.warning(
                 "Dialog evaluation failed for agent '%s', skipping dialog",

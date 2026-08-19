@@ -265,3 +265,33 @@ class TestUnsupportedProviderIsLoud:
 
         result = await DialogEvaluator()._run_evaluator(agent, {"result": "text"}, provider)
         assert result.trigger is False
+
+    async def test_non_retryable_provider_error_raises(self) -> None:
+        """``aca`` documents the limitation via ProviderError, not NotImplementedError."""
+        from conductor.exceptions import ProviderError
+
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            side_effect=ProviderError("aca: dialog turns are not supported", is_retryable=False)
+        )
+        agent = AgentDef(
+            name="grill", prompt="hi", dialog=DialogConfig(trigger_prompt="ask if unsure")
+        )
+
+        with pytest.raises(ProviderError, match="not supported"):
+            await DialogEvaluator()._run_evaluator(agent, {"result": "text"}, provider)
+
+    async def test_retryable_provider_error_still_skips(self) -> None:
+        """A transient provider failure must stay fail-open."""
+        from conductor.exceptions import ProviderError
+
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            side_effect=ProviderError("connection reset", is_retryable=True)
+        )
+        agent = AgentDef(
+            name="grill", prompt="hi", dialog=DialogConfig(trigger_prompt="ask if unsure")
+        )
+
+        result = await DialogEvaluator()._run_evaluator(agent, {"result": "text"}, provider)
+        assert result.trigger is False
