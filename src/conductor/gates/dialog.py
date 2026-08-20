@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import sys
 import uuid
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -92,6 +93,12 @@ def _extract_ready_marker(response: str) -> tuple[bool, str]:
     stripped = response.rstrip()
     if stripped.endswith(_READY_MARKER):
         cleaned = stripped[: -len(_READY_MARKER)].rstrip()
+        # A message that still ends in a question is not a completion proposal,
+        # whatever the marker claims. Honouring it would show the user
+        # "the agent believes it has enough information to continue" directly
+        # under a question, and put the dialog in approve-only mode mid-interview.
+        if cleaned.endswith("?"):
+            return False, cleaned
         return True, cleaned
     return False, response
 
@@ -165,6 +172,9 @@ class DialogHandler:
         self.skip_dialogs = skip_dialogs
         self.emitter = emitter
         self.web_dashboard = web_dashboard
+        # Long-lived stdin reader for web+terminal dialogs; see
+        # `_await_dialog_reply` for why it must outlive a single turn.
+        self._term_reader: asyncio.Task[str | None] | None = None
 
     async def handle_dialog(
         self,
@@ -318,7 +328,10 @@ class DialogHandler:
 
             history.append({"role": "assistant", "content": agent_response})
             ready_proposed, clean_response = _extract_ready_marker(agent_response)
-            stored_response = clean_response if ready_proposed else agent_response
+            # Always the cleaned text: _extract_ready_marker strips a trailing
+            # marker even when it declines to treat it as a proposal, so the
+            # raw marker never reaches the transcript or either UI.
+            stored_response = clean_response
             result.messages.append(DialogMessage(role="agent", content=stored_response))
             self._emit_event(
                 "dialog_message",
@@ -340,7 +353,11 @@ class DialogHandler:
                 approval = await self._get_user_input(
                     prompt_text=styled("[bold]Continue?[/bold] ([green]yes[/green]/no)")
                 )
-                if approval is None or approval.lower() in ("yes", "y", ""):
+                if (
+                    approval is None
+                    or approval.lower() in ("yes", "y", "")
+                    or self._is_dismiss(approval)
+                ):
                     self._display_dialog_end(dismissed_by="agent_approved")
                     break
                 # User wants to keep chatting
@@ -348,7 +365,7 @@ class DialogHandler:
                 result.messages.append(DialogMessage(role="user", content=approval))
                 continue
 
-            self._display_agent_message(agent_response)
+            self._display_agent_message(stored_response)
 
         self._emit_event(
             "dialog_completed",
@@ -411,9 +428,12 @@ class DialogHandler:
                 "content": opening_question,
             },
         )
+        # Echo to the console too: the terminal accepts answers for this dialog,
+        # so it has to show what is being answered.
+        self._display_agent_message(opening_question)
 
         # Wait for engagement decision from web client
-        msg = await self.web_dashboard.wait_for_dialog_message(agent.name, dialog_id)
+        msg = await self._await_dialog_reply(agent.name, dialog_id)
         if msg.get("type") == "dialog_decline":
             result.user_declined = True
             self._emit_event(
@@ -487,7 +507,7 @@ class DialogHandler:
                     },
                 )
                 # Wait for next user message
-                msg = await self.web_dashboard.wait_for_dialog_message(agent.name, dialog_id)
+                msg = await self._await_dialog_reply(agent.name, dialog_id)
                 if msg.get("type") == "dialog_decline":
                     result.user_dismissed = True
                     break
@@ -509,7 +529,10 @@ class DialogHandler:
 
             history.append({"role": "assistant", "content": agent_response})
             ready_proposed, clean_response = _extract_ready_marker(agent_response)
-            stored_response = clean_response if ready_proposed else agent_response
+            # Always the cleaned text: _extract_ready_marker strips a trailing
+            # marker even when it declines to treat it as a proposal, so the
+            # raw marker never reaches the transcript or either UI.
+            stored_response = clean_response
             result.messages.append(DialogMessage(role="agent", content=stored_response))
 
             # Check if agent proposed completion (terminal marker only)
@@ -525,12 +548,17 @@ class DialogHandler:
                         + "\n\n*The agent believes it has enough information to continue.*",
                     },
                 )
+                self._display_agent_message(clean_response)
+                self._display_continue_proposal()
                 # Wait for approval or continuation
-                msg = await self.web_dashboard.wait_for_dialog_message(agent.name, dialog_id)
+                msg = await self._await_dialog_reply(agent.name, dialog_id)
                 if msg.get("type") == "dialog_decline":
                     break
                 approval = msg.get("content", "")
-                if approval.lower() in ("yes", "y", ""):
+                # Accept the dismiss keywords here too, not just yes/y/empty:
+                # the built-in dialog prompt tells users "done"/"continue" work,
+                # and swallowing them as chat text is the dialog-exit gotcha.
+                if approval.lower() in ("yes", "y", "") or self._is_dismiss(approval):
                     break
                 # User wants to keep chatting — treat approval as the next user
                 # turn. The loop top will append it to provider history exactly
@@ -557,9 +585,10 @@ class DialogHandler:
                     "content": stored_response,
                 },
             )
+            self._display_agent_message(stored_response)
 
             # Wait for next user message
-            msg = await self.web_dashboard.wait_for_dialog_message(agent.name, dialog_id)
+            msg = await self._await_dialog_reply(agent.name, dialog_id)
             if msg.get("type") == "dialog_decline":
                 result.user_dismissed = True
                 break
@@ -747,6 +776,60 @@ class DialogHandler:
     def _is_dismiss(self, text: str) -> bool:
         """Check if user input is a dismiss signal."""
         return text.strip().lower() in DISMISS_KEYWORDS
+
+    async def _await_dialog_reply(self, agent_name: str, dialog_id: str) -> dict[str, Any]:
+        """Await the next dialog reply from the dashboard OR the terminal.
+
+        Both surfaces are live for the whole turn and the first to answer wins;
+        the loser is cancelled. The web waiter is only ever cancelled while
+        parked on an empty queue -- if it had dequeued it would have returned --
+        so cancelling cannot drop a message meant for this dialog.
+
+        Returns:
+            A payload shaped like ``wait_for_dialog_message``'s: ``type`` of
+            ``dialog_message`` / ``dialog_decline`` plus optional ``content``.
+        """
+        assert self.web_dashboard is not None
+        web = asyncio.ensure_future(
+            self.web_dashboard.wait_for_dialog_message(agent_name, dialog_id)
+        )
+        # ONE long-lived stdin reader for the whole dialog, kept on the instance.
+        # `_get_user_input` blocks a thread in `Prompt.ask`, and cancelling the
+        # task does NOT unblock that thread -- it stays parked on stdin. Spawning
+        # a reader per turn therefore leaks a thread per turn, and the stale
+        # readers then compete for the next line, so a web answer on turn 2
+        # would be accepted by the dashboard and never consumed here.
+        # No reader without a real terminal: `Prompt.ask` on a non-tty stdin
+        # (CI, a pipe, pytest's captured stdin) raises instead of waiting, and
+        # there is nobody there to answer anyway.
+        if not sys.stdin.isatty():
+            return await web
+
+        if self._term_reader is None or self._term_reader.done():
+            self._term_reader = asyncio.ensure_future(self._get_user_input())
+        term = self._term_reader
+        try:
+            await asyncio.wait({web, term}, return_when=asyncio.FIRST_COMPLETED)
+
+            if term.done():
+                text = term.result()
+                self._term_reader = None
+                # EOF/Ctrl-D is not an answer -- a piped or closed stdin returns
+                # it at once, which would otherwise decline instantly. Keep
+                # waiting on the dashboard (do NOT cancel `web` above this).
+                if text is None:
+                    return await web
+                web.cancel()
+                if self._is_dismiss(text):
+                    return {"type": "dialog_decline"}
+                return {"type": "dialog_message", "content": text}
+
+            # Web won. Leave the reader running: it owns a blocked thread that
+            # cancelling cannot reclaim, so the next turn reuses it.
+            return web.result()
+        except asyncio.CancelledError:
+            web.cancel()
+            raise
 
     def _emit_event(self, event_type: str, data: dict[str, Any]) -> None:
         """Emit a dialog event if emitter is available."""
