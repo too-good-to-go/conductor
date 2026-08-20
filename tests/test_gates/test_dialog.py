@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -441,6 +442,119 @@ class TestWebDialogFlow:
         dashboard.wait_for_dialog_message = AsyncMock(side_effect=scripted_messages)
         handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
         return handler, dashboard
+
+    @pytest.mark.asyncio
+    async def test_question_with_marker_is_not_a_proposal(self) -> None:
+        """A marker on a message that still asks a question is ignored.
+
+        The agent sometimes appends the marker to a question. Honouring it would
+        claim "enough information to continue" under a question and drop the
+        dialog into approve-only mode mid-interview.
+        """
+        handler, _ = self._make_handler(
+            [
+                {"type": "dialog_message", "content": "answer one"},
+                {"type": "dialog_message", "content": "done"},
+            ]
+        )
+        agent = AgentDef(name="test", prompt="test", dialog=DialogConfig(trigger_prompt="test"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(
+            return_value="And which repo owns checkout? [READY_TO_CONTINUE]"
+        )
+
+        result = await handler.handle_dialog(
+            agent=agent,
+            agent_output={"result": "test"},
+            opening_question="First?",
+            provider=provider,
+        )
+
+        assert result.agent_proposed_continue is False
+        assert result.user_dismissed is True
+        # The marker is stripped even though it was not treated as a proposal.
+        assert all("READY_TO_CONTINUE" not in m.content for m in result.messages)
+
+    @pytest.mark.asyncio
+    async def test_dismiss_keyword_exits_at_approval_prompt(self) -> None:
+        """"done" ends a genuine proposal, not just yes/y/empty."""
+        handler, _ = self._make_handler(
+            [
+                {"type": "dialog_message", "content": "answer one"},
+                {"type": "dialog_message", "content": "done"},
+            ]
+        )
+        agent = AgentDef(name="test", prompt="test", dialog=DialogConfig(trigger_prompt="test"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="I have enough. [READY_TO_CONTINUE]")
+
+        result = await handler.handle_dialog(
+            agent=agent,
+            agent_output={"result": "test"},
+            opening_question="First?",
+            provider=provider,
+        )
+
+        assert result.agent_proposed_continue is True
+        # "done" must not be forwarded to the provider as another chat turn.
+        assert provider.execute_dialog_turn.await_count == 1
+
+    @pytest.mark.asyncio
+    @patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True)
+    async def test_terminal_answer_wins_when_dashboard_silent(self, _isatty: MagicMock) -> None:
+        """With a dashboard attached, a terminal answer still drives the dialog.
+
+        Both surfaces are live per turn; here the dashboard never replies, so the
+        terminal input must win instead of the dialog hanging on the web queue.
+        """
+        dashboard = MagicMock()
+        never = asyncio.Event()
+
+        async def _never_replies(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            await never.wait()
+            raise AssertionError("unreachable")
+
+        dashboard.wait_for_dialog_message = _never_replies
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
+        handler._get_user_input = AsyncMock(return_value="from the terminal")  # type: ignore[method-assign]
+
+        msg = await asyncio.wait_for(handler._await_dialog_reply("test", "d1"), timeout=2)
+
+        assert msg == {"type": "dialog_message", "content": "from the terminal"}
+
+    @pytest.mark.asyncio
+    @patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True)
+    async def test_terminal_eof_falls_back_to_dashboard(self, _isatty: MagicMock) -> None:
+        """EOF on stdin is not an answer -- the dashboard reply must still land."""
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            return_value={"type": "dialog_message", "content": "from the web"}
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
+        handler._get_user_input = AsyncMock(return_value=None)  # type: ignore[method-assign]
+
+        msg = await asyncio.wait_for(handler._await_dialog_reply("test", "d1"), timeout=2)
+
+        assert msg == {"type": "dialog_message", "content": "from the web"}
+
+    @pytest.mark.asyncio
+    @patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True)
+    async def test_terminal_dismiss_maps_to_decline(self, _isatty: MagicMock) -> None:
+        """A terminal dismiss keyword becomes the web flow's decline payload."""
+        dashboard = MagicMock()
+        never = asyncio.Event()
+
+        async def _never_replies(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+            await never.wait()
+            raise AssertionError("unreachable")
+
+        dashboard.wait_for_dialog_message = _never_replies
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
+        handler._get_user_input = AsyncMock(return_value="done")  # type: ignore[method-assign]
+
+        msg = await asyncio.wait_for(handler._await_dialog_reply("test", "d1"), timeout=2)
+
+        assert msg == {"type": "dialog_decline"}
 
     @pytest.mark.asyncio
     async def test_web_decline_at_engagement(self) -> None:
