@@ -19,6 +19,13 @@ genuinely unwelcome in some places -- over a slow SSH link, inside a
 terminal multiplexer being recorded, or on battery -- and because a reader
 who finds movement distracting should not have to choose between that and
 the whole tool.
+
+One of those cases is detected rather than left to the reader to notice:
+:func:`is_remote_session` identifies an RDP session, and
+:func:`animations_enabled` turns animation off automatically for it, with
+``CONDUCTOR_FLEET_ANIM`` as the explicit force-on override. The list above
+is deliberately *not* all detected -- see :func:`is_remote_session` for why
+RDP is the only one that earns an automatic default.
 """
 
 from __future__ import annotations
@@ -50,14 +57,93 @@ _BREATH_DIVISOR = 4
 SPARK_GLYPHS = "▁▂▃▄▅▆▇█"
 
 
+def is_remote_session() -> str | None:
+    """Detect a session whose transport makes a 10fps repaint genuinely costly.
+
+    Modelled on :func:`conductor.fleet.tui.actions._is_wsl`'s style: stdlib
+    environment sniffing only, nothing here raises, and each signal is
+    trusted for a documented reason rather than guessed at.
+
+    RDP: ``SESSIONNAME`` names the session type Windows assigned this
+    logon, and every Remote Desktop session's name starts with
+    ``RDP-Tcp`` (e.g. ``RDP-Tcp#0``) -- the physical console session is
+    named plain ``Console`` instead, which is why the match is a prefix
+    check rather than "is the variable set at all".
+
+    **SSH is deliberately not detected here**, even though it is the case
+    the module docstring above names, because the two transports are not
+    comparable and measurement bore that out. RDP renders server-side into
+    a framebuffer and then diffs, encodes and ships *changed pixel
+    regions* with codecs tuned for mostly-static desktop content, so cost
+    scales with pixels changed per second and a churning text region is
+    the pathological case. SSH ships the *ANSI byte stream* and the
+    client's own terminal renders it, so cost scales with bytes of changed
+    text -- a few hundred per frame, fire-and-forget with no per-frame
+    round trip, meaning neither bandwidth nor latency compounds. The two
+    differ by orders of magnitude.
+
+    What the module docstring actually names is a *slow* SSH link, and
+    there is no signal for slow -- only for "SSH at all", which is
+    overwhelmingly a fast LAN or broadband link. Disabling on that signal
+    would degrade the common case, and announce a problem the reader does
+    not have, to buy nothing. ``CONDUCTOR_FLEET_NO_ANIM`` remains the
+    remedy for a link that genuinely is slow, and for every remote
+    transport with no reliable signal at all (VNC, Citrix, xrdp).
+
+    Returns:
+        ``"RDP"`` when detected, otherwise ``None``. Typed as ``str |
+        None`` rather than ``bool`` so a second transport that later earns
+        an automatic default can be added without churning either this
+        signature or :func:`disabled_reason`'s.
+    """
+    session_name = os.environ.get("SESSIONNAME", "")
+    if session_name.strip().lower().startswith("rdp-tcp"):
+        return "RDP"
+    return None
+
+
 def animations_enabled() -> bool:
     """Return whether animation should run at all.
 
+    An explicit precedence chain, in order:
+
+    1. ``CONDUCTOR_FLEET_NO_ANIM`` set to a non-empty value -- always wins,
+       even over a forced-on request.
+    2. ``CONDUCTOR_FLEET_ANIM`` set to a non-empty value -- forces animation
+       back on over a detected remote session.
+    3. :func:`is_remote_session` -- off by default on a detected RDP
+       session.
+    4. Otherwise on.
+
     Returns:
-        ``False`` when ``CONDUCTOR_FLEET_NO_ANIM`` is set to a non-empty
-        value, otherwise ``True``.
+        Whether animation should run.
     """
-    return not os.environ.get("CONDUCTOR_FLEET_NO_ANIM")
+    if os.environ.get("CONDUCTOR_FLEET_NO_ANIM"):
+        return False
+    if os.environ.get("CONDUCTOR_FLEET_ANIM"):
+        return True
+    return is_remote_session() is None
+
+
+def disabled_reason() -> str | None:
+    """Return why animation was turned off *by detection*, if it was.
+
+    Deliberately distinct from ``not animations_enabled()``: an explicit
+    ``CONDUCTOR_FLEET_NO_ANIM`` is the reader's own choice and should not
+    produce a notification explaining it back to them -- and the whole test
+    suite sets that variable unconditionally (see ``conftest.py``), so a
+    reason tied to it would fire on every test run rather than only the
+    ones that actually exercise detection.
+
+    Returns:
+        ``"RDP"`` when a detected remote session is what disabled
+        animation, otherwise ``None``.
+    """
+    if os.environ.get("CONDUCTOR_FLEET_NO_ANIM"):
+        return None
+    if os.environ.get("CONDUCTOR_FLEET_ANIM"):
+        return None
+    return is_remote_session()
 
 
 def spinner(frame: int, frames: str = SPINNER_FRAMES) -> str:

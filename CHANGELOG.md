@@ -5,10 +5,38 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.32...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
+
+### Fixed
+
+- **MCP tool discovery and structured tool results no longer break with MCP
+  2.0** (#419). MCP 2.0 renamed the Python field on `mcp.types.Tool` from
+  `inputSchema` to `input_schema` and on `mcp.types.CallToolResult` from
+  `structuredContent` to `structured_content`, retaining the camelCase name as
+  the serialization alias in both cases. The second rename failed quietly: a
+  tool returning only structured content raised `AttributeError`, which was
+  wrapped into a `RuntimeError` the model read as an ordinary tool failure.
+  Conductor now reads both fields through a shared helper that tries the 2.x
+  name and falls back to the 1.x one, preserving compatibility with both MCP
+  1.x and 2.x.
+
+## [0.1.33](https://github.com/microsoft/conductor/compare/v0.1.32...v0.1.33) - 2026-08-18
 
 ### Added
 
+- **The Fleet Manager TUI's History screen can now resume a run** by
+  pressing `r` on a row that correlates to an on-disk checkpoint, launching
+  `conductor resume --web-bg` in the background the same way the New Run
+  screen launches a fresh workflow. Gating is checkpoint-driven, never
+  derived from the row's outcome — an `unknown` row (no terminal event)
+  offers Resume exactly like a `failed` one when a checkpoint exists for it,
+  though this only applies when the workflow opted into periodic
+  checkpoints (`runtime.checkpoint`) or failed and left a failure
+  checkpoint behind. A currently-live run is always excluded, regardless of
+  outcome or checkpoint — resuming a run that is still executing would make
+  the new process adopt the original `run_id`, overwrite its run record,
+  and interleave two processes' events into one log. See
+  [`docs/fleet.md`](docs/fleet.md).
 - **Session continuity for the `claude-agent-sdk` provider via a per-agent
   `session_key`** — executions tagged with the same key now continue one
   Claude session instead of each starting cold, so an investigate → check →
@@ -31,6 +59,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   depending on which agent happened to run first. `claude-agent-sdk`
   namespaces its own entries, so they cannot collide with Copilot's
   agent-name keys in the merged map.
+- **Fleet Manager TUI: RDP session detection turns animation off
+  automatically** (issue #462). An RDP session (`SESSIONNAME` starting
+  `RDP-Tcp`) now disables the ~10fps animation clock by default — the same
+  repaint that made the TUI feel laggy over that transport. SSH is
+  deliberately *not* detected: it ships the ANSI byte stream for the local
+  terminal to render (a few hundred bytes per frame), where RDP renders
+  remotely and ships changed pixel regions, so only the latter is costly in
+  practice. `CONDUCTOR_FLEET_NO_ANIM` remains the remedy for a genuinely
+  slow SSH link and for transports with no reliable signal (VNC, Citrix,
+  xrdp). The existing `CONDUCTOR_FLEET_NO_ANIM` force-off switch still
+  wins over detection, and a new `CONDUCTOR_FLEET_ANIM` force-on switch
+  overrides detection when the operator knows the link can take it. Any path
+  that disables animation — explicit `CONDUCTOR_FLEET_NO_ANIM` or detection —
+  now also sets Textual's own `App.animation_level` to `none`, which
+  additionally stops Textual's built-in widget animations (e.g. the tables'
+  smooth-scroll easing); this is a behavior change for existing
+  `CONDUCTOR_FLEET_NO_ANIM` users, not only for the new detection path. See
+  [`docs/fleet.md`](docs/fleet.md#animation-and-remote-sessions).
 
 ### Changed
 
@@ -41,6 +87,80 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   opposite of what the two defaults are for. The 64KB `warn_bytes` default is
   unchanged, so that combination still warns. Workflows that set `max_bytes`
   explicitly are unaffected.
+- **`examples/wait-smoke.yaml` now caps itself at `timeout_seconds: 15`,
+  up from `3`.** It doubles as CI's `--web-bg` launcher smoke fixture, and a
+  cold Windows runner spends seconds of that budget on process and step
+  overhead — so a cap sized for the ~1s the workflow actually waits reported
+  a slow runner as a launcher failure. The timeout path it demonstrates is
+  unchanged; drive it with a larger `--input middle_duration_ms`.
+
+### Fixed
+
+- **Fleet Manager TUI: the ~10fps animation tick no longer repaints the
+  preview pane and footer** (issue #462). `RunsScreen._tick` used to end by
+  calling `_update_gate_detail()`, rebuilding the whole preview `Text` and
+  re-evaluating the footer's key bindings ten times a second for the sake of
+  one spinner glyph — over RDP this made the whole TUI feel laggy. The
+  preview pane is now split into `#run-preview` (the gate section and
+  progress header, rebuilt on data/selection changes only) and
+  `#run-preview-score` (the flowed step chips, the only part that actually
+  animates); the frame tick now only repaints the latter, alongside the
+  animated table cells it already updated. See
+  [`docs/fleet.md`](docs/fleet.md#animation-and-remote-sessions).
+- **`claude` provider: `validate_connection()` no longer fails startup when an
+  Anthropic-compatible endpoint doesn't implement `models.list()`** (issue
+  #455). Azure AI Foundry's Anthropic endpoint, and some LiteLLM/Databricks AI
+  Gateway configurations, answer `/v1/models` with a 404 while `/v1/messages`
+  (what agents actually call) works fine — previously this made every workflow
+  using such an endpoint fail before running a single agent. The startup probe
+  now only fails on positive evidence of a broken setup: an unreachable host,
+  rejected credentials (401/403), or a non-HTTP error. Any other HTTP status
+  logs a warning naming the status code and continues, deferring credential
+  verification to the first agent execution — the same posture the `hermes`
+  provider already documents. See
+  [`docs/providers/claude.md`](docs/providers/claude.md#startup-connection-validation).
+- **A step with no model no longer constructs a provider just to report a
+  context window.** Every step type emitted `agent_started` with a
+  `context_window_max` resolved through the provider, and the registry builds
+  providers lazily — so a `wait`, `set`, `script`, `terminate`, or
+  `human_gate` step built an SDK client whose only possible answer was
+  `None`. That construction runs inside the engine's timed loop, so it was
+  charged to `limits.timeout_seconds`: a provider-free wait workflow paid
+  ~0.4s of it locally and enough on a cold Windows CI runner to time the
+  workflow out and fail the `--web-bg` launcher smoke job. Provider-backed
+  agents are unaffected — they still report the window on both
+  `agent_started` and `agent_completed`.
+- **Fleet Manager TUI: the footer now says what `enter` does on each
+  screen** (issue #459). Every drill-down screen bound `enter` but left it
+  unlabeled, so the one key that navigates the TUI was the one key the
+  footer never advertised — Runs opens the run detail, Run detail opens the
+  step detail, History surfaces the `conductor replay` command, Providers
+  expands or collapses a provider, and Registries opens that registry's
+  workflows. The binding is also hidden whenever it would do nothing: an
+  empty, failed, or still-loading table, or a Providers sub-row that is not
+  a provider. Expanding a provider a second time now collapses the provider
+  you were actually on rather than whichever row the rebuild left under the
+  cursor. See [`docs/fleet.md`](docs/fleet.md).
+- **The Pydantic AI provider (`claude`) never retried on HTTP 429/5xx or
+  transport errors** (#454). pydantic-ai's Anthropic model translates the
+  SDK's exceptions before Conductor ever sees them (a private helper,
+  `_map_api_errors` in pydantic-ai 2.x, written inline at the 1.44.0 floor)
+  into `ModelHTTPError` (for an HTTP error response) and `ModelAPIError`
+  (for a connection/timeout failure), so neither the SDK class names
+  nor the `anthropic.APIStatusError` check that `_is_retryable_error`
+  relied on ever matched — every attempt failed fast as a non-retryable
+  error regardless of `retry:` configuration. Both translated types are now
+  classified directly, matching the existing 429/5xx retryable set, and a
+  server's `retry-after` value is recovered from `__cause__` (the
+  translation drops response headers, but preserves the original SDK
+  exception there) or from the response body.
+- **A per-agent `retry.delay_seconds` larger than the 30s provider default
+  was silently clamped back down to 30s** on both the Pydantic AI (`claude`)
+  and Copilot providers, so `delay_seconds: 60` produced 30s waits instead
+  of the stated 60s. The internal backoff cap is now `max(default_max_delay,
+  delay_seconds)`, so a larger stated delay raises the cap instead of being
+  clamped by it; existing configurations with `delay_seconds` below the
+  default are unaffected.
 
 ## [0.1.32](https://github.com/microsoft/conductor/compare/v0.1.31...v0.1.32) - 2026-08-16
 

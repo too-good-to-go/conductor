@@ -10,6 +10,7 @@ same run-discovery mechanism.
 
 - [The problem this solves](#the-problem-this-solves)
 - [Installing the TUI](#installing-the-tui)
+- [Animation and remote sessions](#animation-and-remote-sessions)
 - [Screens](#screens)
 - [Key bindings](#key-bindings)
 - [Status vocabulary](#status-vocabulary)
@@ -93,6 +94,78 @@ curl -sSfL https://aka.ms/conductor/install.sh | sh -s -- --no-preserve-extras
 `conductor fleet list` and `conductor fleet prune` are unaffected either
 way — only the bare, no-subcommand invocation needs `textual`.
 
+## Animation and remote sessions
+
+The TUI animates three things: the status badge of a running or at-gate
+row (a spinner or a breathing glyph), the Runs screen's preview pane —
+specifically the live step in its flowed score of chips, which is the
+one part of the pane that moves — and the launch splash. All three are
+driven by the same ~10fps interval and gate on the same check, so they
+turn on and off together.
+
+That clock only ever repaints what actually moves: the animated table
+cells and the preview's score line. Rebuilding the whole preview pane and
+re-evaluating the footer's key bindings ten times a second — which the
+clock used to do — is what made the TUI feel laggy over a slow link
+(issue #462); those now update at the ~2s data-poll rate and on cursor
+moves instead.
+
+A repaint ten times a second is also genuinely costly over some
+connections, so Conductor detects one kind of remote session and turns
+animation off automatically for it:
+
+- **RDP**, detected from `SESSIONNAME` starting with `RDP-Tcp` (Windows
+  names every Remote Desktop session that way; the physical console
+  session is named plain `Console` and is not a match).
+
+**SSH is deliberately not detected**, even though a slow SSH link is a
+real reason to want animation off. The two transports are not comparable:
+RDP renders on the remote machine and then diffs, encodes and ships
+*changed pixel regions*, so its cost scales with pixels changed per second
+and a churning text region is the worst case for it. SSH ships the ANSI
+byte stream and your local terminal does the rendering, so its cost is a
+few hundred bytes per frame — negligible, and measured as such. What
+actually hurts is a *slow* link, and there is no signal for slow, only for
+"SSH at all", which is usually a fast one. Set `CONDUCTOR_FLEET_NO_ANIM=1`
+when your link genuinely is slow — that is also the answer for remote
+transports with no reliable signal at all, such as VNC, Citrix, or xrdp.
+
+Any path that disables animation — explicit `CONDUCTOR_FLEET_NO_ANIM` or
+detection — also sets Textual's own `App.animation_level` to `"none"`,
+which additionally stops Textual's built-in widget animations (for example
+the tables' smooth-scroll easing) — a broader effect than the Fleet-specific
+clock alone, and worth knowing if you were relying on that easing.
+
+Two environment variables override this, and the *off* switch always
+wins if both are set:
+
+| Variable | Effect |
+| --- | --- |
+| `CONDUCTOR_FLEET_NO_ANIM` | Force animation off, regardless of session detection. Wins over `CONDUCTOR_FLEET_ANIM` if both are set. |
+| `CONDUCTOR_FLEET_ANIM` | Force animation back on over a detected RDP session. |
+
+```bash
+# Force animation off (e.g. a slow SSH link, recording a terminal
+# session, or on battery):
+CONDUCTOR_FLEET_NO_ANIM=1 conductor fleet
+
+# Force animation on over RDP, once you know the link can take it:
+CONDUCTOR_FLEET_ANIM=1 conductor fleet
+```
+
+A detected remote session shows a one-time notification naming the
+detected session type and the `CONDUCTOR_FLEET_ANIM=1` override; an
+explicit `CONDUCTOR_FLEET_NO_ANIM` does not, since that path is already
+the reader's own choice.
+
+Three more Textual-level knobs — `TEXTUAL_FPS`, `TEXTUAL_SMOOTH_SCROLL`,
+and `TEXTUAL_ANIMATIONS` — tune the framework's own rendering and are
+deliberately **not** set by Conductor for you. They are read once, at
+import time, as `Final` module constants (`textual/constants.py`), so
+honoring them would mean setting them before `textual` is imported —
+i.e. before every `conductor` invocation, not just `conductor fleet`.
+Set them yourself in your shell environment if you want to tune them.
+
 ## Screens
 
 The TUI uses Textual's `Screen` push/pop stack, so every drill-down has a
@@ -152,10 +225,32 @@ stack rather than each managing its own navigation state.
   records (a completed run's record has already been removed). A log
   with no `workflow_completed`/`workflow_failed` terminal event is listed
   too, shown as **unknown**, never as "running" — a non-terminal log is
-  not evidence of a live run. Selecting a row surfaces the exact
+  not evidence of a live run, and a **currently-live** run is always
+  excluded from Resume regardless of what checkpoint would otherwise
+  correlate to it, since resuming it would make the new process adopt
+  the live run's `run_id`, overwrite its run record, and interleave two
+  processes' events into one log. Selecting a row surfaces the exact
   `conductor replay <log>` command rather than opening a viewer inside
   the TUI — depth, again, belongs to `replay`/the dashboard, not this
-  screen.
+  screen. A row whose event log correlates to a checkpoint on disk also
+  offers `r`/Resume: pressing it resumes that run in the background
+  through the same `launch_background_resume` path `conductor resume
+  --web-bg` uses, then returns to Runs — the one action this screen
+  performs itself rather than delegating (replay stays a viewer;
+  resuming a run is an action, like Runs killing a process or resolving
+  a gate). The key is offered only when a checkpoint correlates to the
+  row **and** its recorded workflow file still exists; availability is
+  entirely **checkpoint-driven, never outcome-driven** — an `unknown` row
+  with a periodic checkpoint offers Resume, while a `failed` row from an
+  explicit `type: terminate` does not, because that step writes no
+  checkpoint by design. A `completed` row can offer it too, which would
+  re-execute already-finished (possibly billable) work; the notification
+  shown before resuming names the checkpoint's save time and step so that
+  choice is informed rather than hidden. In practice, Resume shows up
+  mostly on `failed` rows, which always carry a failure checkpoint — an
+  `unknown` row only offers it when the workflow opted into
+  [periodic checkpoints](workflow-syntax.md#periodic-checkpoints)
+  (`runtime.checkpoint`), which are off by default.
 
 ## Key bindings
 
@@ -175,8 +270,23 @@ Bindings shown are the Runs (home) screen's; each drill-down screen binds
 | `h` | History |
 | `q` | Quit |
 
-On Run detail, `enter` opens the highlighted step; that screen binds `r`
-to reload and `tab` to switch panes.
+Screens with a row-scoped `enter` advertise it in their own footer:
+
+| Screen | `enter` |
+|--------|---------|
+| Runs | Open run detail for the selected row |
+| Run detail | Open step detail for the highlighted step |
+| History | Surface `conductor replay <log>` for the selected row |
+| Providers | Expand/collapse the highlighted provider |
+| Registries | Open that registry's workflows |
+| Registry workflows | Open that workflow's inputs |
+
+On Providers, `enter` is not offered while a model/status sub-row is
+highlighted — only a provider row itself can be expanded or collapsed.
+The Step-detail screen that `enter` opens from Run detail binds `r` to
+reload and `tab` to switch panes. On History, `r` resumes the
+highlighted row's checkpoint in the background when a checkpoint is
+available (see [above](#screens)).
 
 Inside the Registries drill-down, `n` runs the highlighted (or currently
 displayed) workflow rather than starting from an empty form. A launch
@@ -286,6 +396,15 @@ itself, not for this display). There is no pagination: per the design's
 history in favor of staying simple. Pruning an event log makes that
 run's history permanently unavailable to both the History screen and
 `conductor replay`, since both read the JSONL file directly.
+
+The sweep never descends into the `checkpoints/` subdirectory, and
+checkpoint rotation (`keep_last` on `runtime.checkpoint`) runs entirely
+independently of event-log retention — the two are on separate clocks.
+So a History row can outlive its checkpoint (an event log survives the
+`keep_last` window longer than the checkpoint it once correlated to,
+and Resume disappears from that row) and a checkpoint can just as
+easily outlive its row (the event log gets pruned first, leaving a
+checkpoint on disk with no History entry to resume it from).
 
 ## See Also
 
