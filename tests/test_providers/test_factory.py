@@ -7,7 +7,7 @@ import pytest
 from pydantic import SecretStr
 
 from conductor.config.schema import ProviderSettings, ToolOutputConfig
-from conductor.exceptions import ProviderError
+from conductor.exceptions import ProviderError, ValidationError
 from conductor.providers.claude import ClaudeProvider
 from conductor.providers.copilot import CopilotProvider
 from conductor.providers.factory import create_provider
@@ -40,13 +40,104 @@ class TestCreateProvider:
         await provider.close()
 
     @pytest.mark.asyncio
-    async def test_create_openai_provider_raises(self) -> None:
-        """Test that OpenAI provider raises ProviderError (not implemented)."""
+    async def test_create_openai_agents_provider_raises(self) -> None:
+        """Test that the removed openai-agents provider name raises ProviderError."""
         with pytest.raises(ProviderError) as exc_info:
-            await create_provider("openai-agents")
-        assert "not yet implemented" in str(exc_info.value)
+            await create_provider("openai-agents")  # type: ignore
+        assert "Unknown provider" in str(exc_info.value)
+        assert "openai-agents" in str(exc_info.value)
         assert exc_info.value.suggestion is not None
         assert "copilot" in exc_info.value.suggestion
+
+    @pytest.mark.asyncio
+    async def test_create_openai_temperature_above_ceiling_raises(self) -> None:
+        """OpenAI accepts up to 2.0; values above it are rejected before construction."""
+        with pytest.raises(ValidationError, match="temperature"):
+            await create_provider("openai", validate=False, temperature=2.5)
+
+    @pytest.mark.asyncio
+    async def test_create_claude_temperature_above_ceiling_raises(self) -> None:
+        """Claude's cap is 1.0; 1.1 is rejected before construction."""
+        with pytest.raises(ValidationError, match="temperature"):
+            await create_provider("claude", validate=False, temperature=1.1)
+
+    @pytest.mark.asyncio
+    async def test_create_openai_provider_from_string(self) -> None:
+        """Requirement: factory creates OpenAIProvider from the string 'openai'."""
+        from conductor.providers.openai import OpenAIProvider
+
+        with (
+            patch("conductor.providers.factory.OPENAI_SDK_AVAILABLE", True),
+            patch.object(OpenAIProvider, "_initialize_client"),
+        ):
+            provider = await create_provider("openai", validate=False)
+        assert isinstance(provider, OpenAIProvider)
+
+    @pytest.mark.asyncio
+    async def test_create_openai_provider_from_structured_settings(self) -> None:
+        """Requirement: factory creates OpenAIProvider from structured
+        ProviderSettings(name='openai')."""
+        from conductor.providers.openai import OpenAIProvider
+
+        settings = ProviderSettings(name="openai", api_key=SecretStr("sk-test"))
+        with (
+            patch("conductor.providers.factory.OPENAI_SDK_AVAILABLE", True),
+            patch.object(OpenAIProvider, "_initialize_client"),
+        ):
+            provider = await create_provider("openai", validate=False, provider_settings=settings)
+        assert isinstance(provider, OpenAIProvider)
+        assert provider._api_key == "sk-test"
+
+    @pytest.mark.asyncio
+    async def test_openai_yaml_api_key_precedence_over_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: YAML api_key for name='openai' takes precedence over
+        OPENAI_API_KEY env var."""
+        from conductor.providers.openai import OpenAIProvider
+
+        monkeypatch.setenv("OPENAI_API_KEY", "env-key")
+        settings = ProviderSettings(name="openai", api_key=SecretStr("yaml-key"))
+        with (
+            patch("conductor.providers.factory.OPENAI_SDK_AVAILABLE", True),
+            patch.object(OpenAIProvider, "_initialize_client"),
+        ):
+            provider = await create_provider("openai", validate=False, provider_settings=settings)
+        assert isinstance(provider, OpenAIProvider)
+        assert provider._api_key == "yaml-key"
+
+    @pytest.mark.asyncio
+    async def test_openai_missing_api_key_raises_validation_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Requirement: missing YAML api_key and missing OPENAI_API_KEY raises
+        ValidationError naming OPENAI_API_KEY."""
+        monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+        with (
+            patch("conductor.providers.factory.OPENAI_SDK_AVAILABLE", True),
+            pytest.raises(ValidationError, match="OPENAI_API_KEY"),
+        ):
+            await create_provider("openai", validate=False)
+
+    @pytest.mark.asyncio
+    async def test_openai_provider_receives_default_reasoning_effort(self) -> None:
+        """default_reasoning_effort reaches the OpenAI provider."""
+        from conductor.providers.openai import OpenAIProvider
+
+        provider_settings = ProviderSettings(name="openai", api_key=SecretStr("sk-test"))
+        with (
+            patch("conductor.providers.factory.OPENAI_SDK_AVAILABLE", True),
+            patch("openai.AsyncOpenAI"),
+            patch.object(OpenAIProvider, "_initialize_client"),
+        ):
+            provider = await create_provider(
+                "openai",
+                validate=False,
+                default_reasoning_effort="high",
+                provider_settings=provider_settings,
+            )
+        assert isinstance(provider, OpenAIProvider)
+        assert provider._default_reasoning_effort == "high"
 
     @pytest.mark.asyncio
     async def test_copilot_provider_receives_default_context_tier(self) -> None:
@@ -289,7 +380,7 @@ class TestCreateProvider:
         suggestion = exc_info.value.suggestion
         assert suggestion is not None
         assert "copilot" in suggestion
-        assert "openai-agents" in suggestion
+        assert "openai" in suggestion
         assert "claude" in suggestion
 
 

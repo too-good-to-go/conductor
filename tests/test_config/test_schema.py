@@ -682,9 +682,14 @@ class TestRuntimeConfig:
 
     def test_custom_provider(self) -> None:
         """Test custom provider setting."""
-        config = RuntimeConfig(provider="openai-agents", default_model="gpt-4")
-        assert config.provider.name == "openai-agents"
+        config = RuntimeConfig(provider="openai", default_model="gpt-4")
+        assert config.provider.name == "openai"
         assert config.default_model == "gpt-4"
+
+    def test_openai_agents_rejected_by_schema(self) -> None:
+        """The removed `openai-agents` provider name now fails schema validation."""
+        with pytest.raises(ValidationError):
+            RuntimeConfig(provider="openai-agents", default_model="gpt-4")
 
     def test_working_dir_defaults_to_none(self) -> None:
         """Requirement: runtime.working_dir is an optional workflow-wide default."""
@@ -709,29 +714,20 @@ class TestRuntimeConfig:
 
     def test_temperature_boundary_values(self) -> None:
         """Test temperature field accepts boundary values."""
-        # Lower bound
-        config = RuntimeConfig(temperature=0.0)
-        assert config.temperature == 0.0
-
-        # Upper bound
-        config = RuntimeConfig(temperature=1.0)
-        assert config.temperature == 1.0
-
-        # Mid-range value
-        config = RuntimeConfig(temperature=0.5)
-        assert config.temperature == 0.5
+        assert RuntimeConfig(temperature=0.0).temperature == 0.0
+        assert RuntimeConfig(temperature=1.0).temperature == 1.0
+        assert RuntimeConfig(temperature=2.0).temperature == 2.0
+        assert RuntimeConfig(temperature=0.5).temperature == 0.5
 
     def test_temperature_out_of_range_raises(self) -> None:
         """Test temperature field rejects out-of-range values."""
-        # Below lower bound
         with pytest.raises(ValidationError) as exc_info:
             RuntimeConfig(temperature=-0.1)
         assert "greater than or equal to 0" in str(exc_info.value)
 
-        # Above upper bound
         with pytest.raises(ValidationError) as exc_info:
-            RuntimeConfig(temperature=1.1)
-        assert "less than or equal to 1" in str(exc_info.value)
+            RuntimeConfig(temperature=2.1)
+        assert "less than or equal to 2" in str(exc_info.value)
 
     def test_max_tokens_boundary_values(self) -> None:
         """Test max_tokens field accepts boundary values."""

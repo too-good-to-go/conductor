@@ -6,8 +6,9 @@ provider instances with lazy instantiation and caching.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any
 
+from conductor.config.schema import ProviderName
 from conductor.providers.base import AgentProvider
 from conductor.providers.factory import create_provider
 
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
     from conductor.config.schema import AgentDef, WorkflowConfig
 
 
-ProviderType = Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes"]
+ProviderType = ProviderName
 
 
 class ProviderRegistry:
@@ -124,6 +125,7 @@ class ProviderRegistry:
             timeout=runtime.timeout,
             max_session_seconds=runtime.max_session_seconds,
             max_agent_iterations=runtime.max_agent_iterations,
+            default_reasoning_effort=runtime.default_reasoning_effort,
             provider_settings=provider_settings,
             tool_output=runtime.tool_output,
         )

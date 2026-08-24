@@ -1136,6 +1136,14 @@ def _validate_skill_entries(entries: list[str]) -> list[str]:
     return entries
 
 
+ProviderName = Literal["copilot", "openai", "claude", "claude-agent-sdk", "hermes", "aca"]
+"""Canonical set of supported agent provider names.
+
+Used by :attr:`AgentDef.provider` and :attr:`ProviderSettings.name` so the
+schema, factory, and registry cannot drift out of sync.
+"""
+
+
 class AgentDef(BaseModel):
     """Definition for a single agent in the workflow.
 
@@ -1191,7 +1199,7 @@ class AgentDef(BaseModel):
     ) = None
     """Agent type. Defaults to 'agent' if not specified."""
 
-    provider: Literal["copilot", "claude", "claude-agent-sdk", "hermes"] | None = None
+    provider: ProviderName | None = None
     """Provider override for this agent.
 
     If None (default), the agent uses the workflow.runtime.provider.
@@ -2602,9 +2610,7 @@ class ProviderSettings(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    name: Literal["copilot", "openai-agents", "claude", "claude-agent-sdk", "hermes", "aca"] = (
-        "copilot"
-    )
+    name: ProviderName = "copilot"
     """SDK provider to use for agent execution."""
 
     type: Literal["openai", "azure", "anthropic"] | None = None
@@ -2810,12 +2816,25 @@ class ProviderSettings(BaseModel):
         }
         if self.name != "copilot":
             extras = sorted(k for k, v in copilot_only_fields.items() if v is not None)
+            if self.name == "openai" and extras:
+                if "wire_api" in extras:
+                    raise ValueError(
+                        "Provider fields ['wire_api'] are Copilot-only. "
+                        "The 'openai' provider always speaks the Chat Completions "
+                        "wire API; remove the field."
+                    )
+                if "type" in extras:
+                    raise ValueError(
+                        "Provider fields ['type'] are Copilot-only. "
+                        "The 'openai' provider always speaks the Chat Completions "
+                        "wire API; remove the field."
+                    )
             if extras:
                 raise ValueError(
                     f"Provider fields {extras} are only supported when name='copilot'. "
                     "Structured provider config for other providers is not yet implemented."
                 )
-        if self.name not in ("copilot", "claude", "hermes") and (
+        if self.name not in ("copilot", "openai", "claude", "hermes") and (
             self.base_url is not None or self.api_key is not None
         ):
             raise ValueError(
@@ -3338,8 +3357,8 @@ class RuntimeConfig(BaseModel):
     temperature: float | None = Field(
         None,
         ge=0.0,
-        le=1.0,
-        description="Controls randomness. Range: 0.0-1.0",
+        le=2.0,
+        description="Controls randomness. Range: 0.0-2.0",
     )
     """Temperature parameter for models. Controls randomness in responses."""
 
