@@ -80,15 +80,25 @@ function JsonHighlight({ text }: { text: string }) {
           );
         }
         // Highlight numbers, booleans, null
-        const highlighted = part.replace(
-          /\b(true|false|null)\b|(-?\d+\.?\d*(?:e[+-]?\d+)?)/gi,
-          (match, keyword, num) => {
-            if (keyword) return `<span class="text-amber-400">${match}</span>`;
-            if (num) return `<span class="text-purple-400">${match}</span>`;
-            return match;
-          },
+        // Split on a capturing group so the literals come back as their own
+        // chunks and can be wrapped in spans. Building nodes rather than an
+        // HTML string keeps agent output out of the markup parser (FN-5100).
+        return (
+          <span key={i}>
+            {part.split(/(\b(?:true|false|null)\b|-?\d+\.?\d*(?:e[+-]?\d+)?)/gi).map((chunk, j) =>
+              j % 2 === 0 ? (
+                chunk
+              ) : (
+                <span
+                  key={j}
+                  className={/^(?:true|false|null)$/i.test(chunk) ? 'text-amber-400' : 'text-purple-400'}
+                >
+                  {chunk}
+                </span>
+              ),
+            )}
+          </span>
         );
-        return <span key={i} dangerouslySetInnerHTML={{ __html: highlighted }} />;
       })}
     </>
   );
