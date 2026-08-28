@@ -691,6 +691,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         max_turns: int | None = None,
         max_session_seconds: float | None = None,
         mcp_servers: dict[str, Any] | None = None,
+        setting_sources: list[str] | None = None,
     ) -> None:
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             raise ProviderError(
@@ -698,6 +699,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 suggestion=f"Install with: {install_command('claude-agent-sdk')}",
             )
 
+        # ``None`` becomes ``[]`` — load nothing ambient. Not cosmetic: the SDK
+        # re-defaults an unset ``setting_sources`` to ``["user", "project"]``
+        # whenever ``skills`` is set, so the empty list must be sent explicitly.
+        # See the option block in ``execute``.
+        self._setting_sources: list[str] = list(setting_sources or [])
         self._default_model = model or _DEFAULT_MODEL
         self._default_max_turns = max_turns if max_turns is not None else 50
         self._max_session_seconds = max_session_seconds
@@ -986,16 +992,28 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # plugin-provided servers, and permission_mode bypasses approval
             # for whatever they expose. Only declared servers may attach.
             strict_mcp_config=True,
-            # The skills counterpart of strict_mcp_config, and unconditional
-            # for the same reason: left unset, the CLI loads user settings
-            # (~/.claude/settings.json), project settings (.claude/settings.json)
-            # and local settings — which between them bring in ambient skills,
-            # CLAUDE.md, and hooks the workflow never declared. Setting `skills`
-            # makes this doubly load-bearing: the SDK re-defaults setting_sources
-            # to ["user", "project"] whenever `skills` is set and this is None.
-            # Conductor surfaces instruction files through its own opt-in
-            # `--workspace-instructions`; settings and hooks have no equivalent.
-            setting_sources=[],
+            # The skills counterpart of strict_mcp_config, and empty by
+            # DEFAULT for the same reason: left unset, the CLI loads user
+            # settings (~/.claude/settings.json), project settings
+            # (.claude/settings.json) and local settings — which between them
+            # bring in ambient skills, CLAUDE.md, and hooks the workflow never
+            # declared. Setting `skills` makes this doubly load-bearing: the
+            # SDK re-defaults setting_sources to ["user", "project"] whenever
+            # `skills` is set and this is None, so [] must be explicit.
+            #
+            # Opt back in per workflow with `runtime.provider.setting_sources`.
+            # The case it exists for: an agent whose `working_dir` is a TARGET
+            # repository that ships its own `.claude/skills`. The CLI has
+            # `--plugin-dir` but no `--skill-dir`, so without this a repo must
+            # package its skills as a Claude Code plugin to be reachable at
+            # all. `["project"]` reads them straight from the repo — and the
+            # repo's CLAUDE.md/AGENTS.md with them, which `--workspace-
+            # instructions` cannot do per-step (it resolves one directory
+            # before the first step runs).
+            #
+            # A tier brings everything it defines, hooks included, so this is
+            # only for repositories trusted as much as the workflow itself.
+            setting_sources=self._setting_sources,
             # Load-bearing but invisible in argv: the SDK forwards an explicit
             # list in the `initialize` control request (_internal/query.py), and
             # only there does [] differ from None. None means "CLI defaults

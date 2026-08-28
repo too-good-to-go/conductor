@@ -246,6 +246,7 @@ async def create_provider(
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
                 mcp_servers=mcp_servers,
+                setting_sources=getattr(provider_settings, "setting_sources", None),
             )
         case "aca":
             if not AZURE_IDENTITY_AVAILABLE:

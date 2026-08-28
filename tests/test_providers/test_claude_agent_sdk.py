@@ -2244,6 +2244,77 @@ class TestMcpOptionsWiring:
         # .mcp.json / user-global / plugin servers.
         assert captured["strict"] is True
 
+
+class TestSettingSourcesWiring:
+    """``runtime.provider.setting_sources`` decides what ambient Claude Code
+    settings a session may load. Empty by default; opt-in per workflow."""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_default_sends_an_explicit_empty_list(self) -> None:
+        """``[]`` and ``None`` are NOT interchangeable: the SDK re-defaults an
+        unset value to ``["user", "project"]`` whenever ``skills`` is set, so
+        the empty list has to reach the CLI explicitly."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["sources"] = kwargs["options"].setting_sources
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["sources"] == []
+        assert captured["sources"] is not None
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_sources_reach_the_sdk(self) -> None:
+        """The opt-in case: an agent whose working_dir is a target repo that
+        ships its own ``.claude/skills``, which no plugin root packages."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["sources"] = kwargs["options"].setting_sources
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(setting_sources=["project"])
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["sources"] == ["project"]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_explicit_none_is_normalised_to_empty(self) -> None:
+        """An unset YAML field arrives as ``None`` and must not become the
+        SDK's own default."""
+        assert ClaudeAgentSdkProvider(setting_sources=None)._setting_sources == []
+
+    async def test_factory_forwards_the_field_from_provider_settings(self) -> None:
+        from conductor.config.schema import ProviderSettings, RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(
+            provider=ProviderSettings(name="claude-agent-sdk", setting_sources=["project"])
+        )
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = await ProviderFactory.create_provider(runtime, validate=False)
+        assert provider._setting_sources == ["project"]
+
+    async def test_factory_defaults_to_no_ambient_sources(self) -> None:
+        from conductor.config.schema import ProviderSettings, RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(provider=ProviderSettings(name="claude-agent-sdk"))
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = await ProviderFactory.create_provider(runtime, validate=False)
+        assert provider._setting_sources == []
+
+
+class TestMcpConfigCleanup:
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_config_file_removed_when_query_raises(self) -> None:
         captured: dict = {}
