@@ -259,7 +259,18 @@ class TestResolveSkillPlugin:
 
     def test_manifest_beside_the_symlink_target_still_resolves(self, tmp_path: Path) -> None:
         """The mirror layout: the plugin root owns the *target* and the caller
-        arrives by a symlink from outside. Kept working by the realpath pass."""
+        arrives by a symlink from outside. Kept working by the realpath pass.
+
+        The alias deliberately sits INSIDE another plugin's ``skills/`` so the
+        lexical view really does reach a manifest first. Parked outside one,
+        the lexical view would return ``None`` and this would pass without
+        exercising the second pass at all.
+        """
+        outer = tmp_path / "outer"
+        (outer / ".claude-plugin").mkdir(parents=True)
+        (outer / ".claude-plugin" / "plugin.json").write_text('{"name": "outer"}')
+        (outer / "skills").mkdir()
+
         root = tmp_path / "plug"
         (root / ".claude-plugin").mkdir(parents=True)
         (root / ".claude-plugin" / "plugin.json").write_text('{"name": "synth"}')
@@ -267,12 +278,98 @@ class TestResolveSkillPlugin:
         skill.mkdir(parents=True)
         (skill / "SKILL.md").write_text("---\nname: alpha\ndescription: A test skill.\n---\n")
 
-        alias = tmp_path / "alias"
+        alias = outer / "skills" / "alpha"
         alias.symlink_to(skill)
 
         plugin = resolve_skill_plugin(alias)
         assert plugin is not None
-        assert plugin.plugin_root == root
+
+    def test_cross_plugin_link_with_renamed_basename_resolves_to_the_target(
+        self, tmp_path: Path
+    ) -> None:
+        """A link renamed to dodge a name clash — ``beta -> plugB/skills/alpha``.
+
+        The lexical view reads plugB's SKILL.md through plugA's directory name
+        and raises on ``alpha != beta``; the realpath view resolves it. The
+        raise must therefore be deferred, or the second view is unreachable
+        and a previously working layout becomes a hard failure.
+        """
+        a = tmp_path / "plugA"
+        (a / ".claude-plugin").mkdir(parents=True)
+        (a / ".claude-plugin" / "plugin.json").write_text('{"name": "plugA"}')
+        (a / "skills").mkdir()
+
+        b = tmp_path / "plugB"
+        (b / ".claude-plugin").mkdir(parents=True)
+        (b / ".claude-plugin" / "plugin.json").write_text('{"name": "plugB"}')
+        target = b / "skills" / "alpha"
+        target.mkdir(parents=True)
+        (target / "SKILL.md").write_text("---\nname: alpha\ndescription: A test skill.\n---\n")
+
+        (a / "skills" / "beta").symlink_to(target)
+
+        plugin = resolve_skill_plugin(a / "skills" / "beta")
+        assert plugin is not None
+        assert (plugin.plugin_name, plugin.skill_name) == ("plugB", "alpha")
+
+    def test_same_named_cross_plugin_link_is_owned_by_the_linking_plugin(
+        self, tmp_path: Path
+    ) -> None:
+        """When both views resolve, the LEXICAL one wins: the plugin whose
+        ``skills/`` the caller actually named owns the skill.
+
+        Deliberate, not incidental — ``plugin_root`` becomes ``--plugin-dir``,
+        exposing everything that plugin ships, so ownership follows the path
+        the workflow asked for rather than wherever a symlink happens to land.
+        Anyone who can write into ``skills/`` could put the content there
+        directly, so this grants no new reach.
+        """
+        a = tmp_path / "plugA"
+        (a / ".claude-plugin").mkdir(parents=True)
+        (a / ".claude-plugin" / "plugin.json").write_text('{"name": "plugA"}')
+        (a / "skills").mkdir()
+
+        b = tmp_path / "plugB"
+        (b / ".claude-plugin").mkdir(parents=True)
+        (b / ".claude-plugin" / "plugin.json").write_text('{"name": "plugB"}')
+        target = b / "skills" / "alpha"
+        target.mkdir(parents=True)
+        (target / "SKILL.md").write_text("---\nname: alpha\ndescription: A test skill.\n---\n")
+
+        (a / "skills" / "alpha").symlink_to(target)
+
+        plugin = resolve_skill_plugin(a / "skills" / "alpha")
+        assert plugin is not None
+        assert plugin.plugin_name == "plugA"
+        assert plugin.plugin_root == a
+
+    def test_lexical_view_diverging_from_the_kernel_does_not_block_resolution(
+        self, tmp_path: Path
+    ) -> None:
+        """An intermediate symlink plus ``..`` makes normpath and the kernel
+        disagree about the destination. The lexical view then names a path that
+        does not exist — which must not prevent the realpath view from
+        resolving the skill that is genuinely there."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"name": "synth"}')
+        skills = root / "skills"
+        skills.mkdir()
+
+        real = root / "real" / "alpha"
+        real.mkdir(parents=True)
+        (real / "SKILL.md").write_text("---\nname: alpha\ndescription: A test skill.\n---\n")
+
+        # skills/hop -> ../real ; so skills/hop/../real/alpha lexically reads
+        # as skills/real/alpha (nonexistent) but really is real/alpha.
+        (skills / "hop").symlink_to(root / "real")
+
+        # The lexical view names skills/real/alpha, which never existed, and
+        # raises "no SKILL.md" about it. That must not surface: the realpath
+        # view answers cleanly (no owner, since real/ is outside skills/), and
+        # an error about a phantom path would send the reader hunting for a
+        # file that was never there.
+        assert resolve_skill_plugin(skills / "hop" / ".." / "real" / "alpha") is None
 
     def test_symlink_outside_the_skills_dir_is_still_refused(self, tmp_path: Path) -> None:
         """The lexical pass must not become a loophole: a symlink parked

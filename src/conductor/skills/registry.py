@@ -646,10 +646,31 @@ def resolve_skill_plugin(skill_dir: Path) -> SkillPlugin | None:
     lexical = Path(os.path.normpath(skill_dir.absolute()))
     real = skill_dir.resolve()
 
+    # Raises are DEFERRED, not propagated from the first view that hits one:
+    # a cross-plugin link (plugA/skills/beta -> plugB/skills/alpha) makes the
+    # lexical view read plugB's SKILL.md through plugA's directory name and
+    # raise on the mismatch, while the realpath view resolves it correctly to
+    # plugB. Raising eagerly there would make the second view unreachable —
+    # the very thing it exists for — and turn a working resolution into a
+    # non-retryable ProviderError. A raise is only the answer when NO view
+    # found an owner.
+    # Only an error about a directory that EXISTS is worth reporting. normpath
+    # is lexical and can disagree with the kernel (an intermediate symlink plus
+    # ``..``), so the lexical view may name a path that was never on disk;
+    # raising about it sends the reader hunting for a file that does not exist,
+    # and hides the other view's clean answer.
+    held: SkillPluginError | None = None
     for probe in [lexical] if lexical == real else [lexical, real]:
-        owner = _owning_plugin(probe)
+        try:
+            owner = _owning_plugin(probe)
+        except SkillPluginError as exc:
+            if held is None and probe.is_dir():
+                held = exc
+            continue
         if owner is not None:
             return owner
+    if held is not None:
+        raise held
     return None
 
 
@@ -657,8 +678,8 @@ def _owning_plugin(skill_dir: Path) -> SkillPlugin | None:
     """One ancestry pass for :func:`resolve_skill_plugin`.
 
     Split out so the lexical and realpath views of the same directory run
-    byte-identical logic — including the raises, which must fire on
-    whichever view actually locates the manifest.
+    byte-identical logic. May raise :class:`SkillPluginError`; the caller
+    defers it, since another view may still resolve cleanly.
     """
     for candidate in skill_dir.parents[:_PLUGIN_SEARCH_DEPTH]:
         manifest = find_manifest(candidate)
