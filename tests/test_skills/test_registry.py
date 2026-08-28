@@ -15,6 +15,7 @@ from conductor.skills import (
     SkillNotFoundError,
     SkillPlugin,
     SkillPluginError,
+    expand_skills_root,
     get_skill_directory,
     list_builtin_skills,
     resolve_skill_plugin,
@@ -211,6 +212,97 @@ class TestResolveSkillPlugin:
         skill = _make_plugin(tmp_path, manifest=f'{{"name": "{name}"}}')
         with pytest.raises(SkillPluginError, match="outside"):
             resolve_skill_plugin(skill)
+
+    def test_symlinked_skill_directory_resolves_to_its_plugin(self, tmp_path: Path) -> None:
+        """A plugin may ship a skill directory as a symlink to a tree kept
+        elsewhere. Collapsing symlinks before the ancestry walk loses the
+        plugin root, so the skill was refused with no diagnostic even though
+        ``expand_skills_root`` had already accepted it."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"name": "synth"}')
+        (root / "skills").mkdir()
+
+        target = tmp_path / "elsewhere" / "alpha"
+        target.mkdir(parents=True)
+        (target / "SKILL.md").write_text("---\nname: alpha\ndescription: A test skill.\n---\n")
+
+        link = root / "skills" / "alpha"
+        link.symlink_to(target)
+
+        # The premise: discovery hands this exact path to the resolver.
+        assert expand_skills_root(root / "skills")[0] == [link]
+
+        plugin = resolve_skill_plugin(link)
+        assert plugin is not None
+        assert (plugin.plugin_name, plugin.skill_name) == ("synth", "alpha")
+        assert plugin.plugin_root == root
+
+    def test_symlinked_skills_dir_resolves_to_its_plugin(self, tmp_path: Path) -> None:
+        """The whole ``skills/`` root may be the symlink rather than each
+        child — the layout used by a repo keeping one tool-agnostic source
+        directory that several CLIs point into."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"name": "synth"}')
+
+        real_skills = tmp_path / "agents" / "skills"
+        (real_skills / "alpha").mkdir(parents=True)
+        (real_skills / "alpha" / "SKILL.md").write_text(
+            "---\nname: alpha\ndescription: A test skill.\n---\n"
+        )
+        (root / "skills").symlink_to(real_skills)
+
+        plugin = resolve_skill_plugin(root / "skills" / "alpha")
+        assert plugin is not None
+        assert plugin.plugin_root == root
+
+    def test_manifest_beside_the_symlink_target_still_resolves(self, tmp_path: Path) -> None:
+        """The mirror layout: the plugin root owns the *target* and the caller
+        arrives by a symlink from outside. Kept working by the realpath pass."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"name": "synth"}')
+        skill = root / "skills" / "alpha"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: alpha\ndescription: A test skill.\n---\n")
+
+        alias = tmp_path / "alias"
+        alias.symlink_to(skill)
+
+        plugin = resolve_skill_plugin(alias)
+        assert plugin is not None
+        assert plugin.plugin_root == root
+
+    def test_symlink_outside_the_skills_dir_is_still_refused(self, tmp_path: Path) -> None:
+        """The lexical pass must not become a loophole: a symlink parked
+        outside ``skills/`` is not shipped by the plugin, on either view."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"name": "synth"}')
+        (root / "elsewhere").mkdir()
+
+        target = tmp_path / "outside" / "alpha"
+        target.mkdir(parents=True)
+        (target / "SKILL.md").write_text("---\nname: alpha\ndescription: A test skill.\n---\n")
+        link = root / "elsewhere" / "alpha"
+        link.symlink_to(target)
+
+        assert resolve_skill_plugin(link) is None
+
+    def test_dotdot_traversal_does_not_fake_containment(self, tmp_path: Path) -> None:
+        """``absolute()`` leaves ``..`` in place and the containment test is
+        lexical, so normalisation is what stops a traversal path from reading
+        as though it lived under ``skills/``."""
+        root = tmp_path / "plug"
+        (root / ".claude-plugin").mkdir(parents=True)
+        (root / ".claude-plugin" / "plugin.json").write_text('{"name": "synth"}')
+        (root / "skills").mkdir()
+        stray = root / "elsewhere" / "alpha"
+        stray.mkdir(parents=True)
+        (stray / "SKILL.md").write_text("---\nname: alpha\ndescription: A test skill.\n---\n")
+
+        assert resolve_skill_plugin(root / "skills" / ".." / "elsewhere" / "alpha") is None
 
     def test_missing_skill_md_raises(self, tmp_path: Path) -> None:
         skill = _make_plugin(tmp_path, frontmatter_name=None)

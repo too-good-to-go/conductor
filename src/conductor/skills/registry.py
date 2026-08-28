@@ -611,6 +611,16 @@ def resolve_skill_plugin(skill_dir: Path) -> SkillPlugin | None:
     directory, so an unrelated plugin further up the tree cannot adopt a
     skill it does not ship.
 
+    The walk runs twice: once over the path as given (absolutised, ``..``
+    normalised, symlinks left intact) and once over its realpath. The
+    lexical view comes first because a plugin may ship its ``skills/`` —
+    or an individual skill directory — as a symlink pointing outside the
+    plugin root. Collapsing symlinks up front destroys the very ancestry
+    this walk needs, so the owning plugin was refused with no diagnostic
+    even though :func:`expand_skills_root` had accepted the same
+    directory. The realpath view is kept for the mirror layout, where the
+    manifest sits beside the symlink's *target* rather than the symlink.
+
     Args:
         skill_dir: Path to a skill directory (the one holding
             ``SKILL.md``). Resolved to an absolute path.
@@ -629,7 +639,27 @@ def resolve_skill_plugin(skill_dir: Path) -> SkillPlugin | None:
             agent running without the skill it declared, with nothing to
             diagnose it by.
     """
-    skill_dir = skill_dir.resolve()
+    # normpath, not resolve(): ``absolute()`` alone leaves ``..`` segments in
+    # place, and the containment test below is lexical — a path like
+    # ``plug/skills/../elsewhere/s`` would otherwise read as living under
+    # ``plug/skills``.
+    lexical = Path(os.path.normpath(skill_dir.absolute()))
+    real = skill_dir.resolve()
+
+    for probe in [lexical] if lexical == real else [lexical, real]:
+        owner = _owning_plugin(probe)
+        if owner is not None:
+            return owner
+    return None
+
+
+def _owning_plugin(skill_dir: Path) -> SkillPlugin | None:
+    """One ancestry pass for :func:`resolve_skill_plugin`.
+
+    Split out so the lexical and realpath views of the same directory run
+    byte-identical logic — including the raises, which must fire on
+    whichever view actually locates the manifest.
+    """
     for candidate in skill_dir.parents[:_PLUGIN_SEARCH_DEPTH]:
         manifest = find_manifest(candidate)
         if manifest is None:
