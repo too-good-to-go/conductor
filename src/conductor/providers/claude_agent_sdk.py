@@ -319,6 +319,33 @@ def _stdio_path_args(mcp_servers: dict[str, Any]) -> list[str]:
     return sorted(set(paths))
 
 
+def _resolve_skill_filter(skill_names: list[str], setting_sources: list[str]) -> list[str] | str:
+    """Value for ``ClaudeAgentOptions.skills`` — the name-level skill filter.
+
+    Three cases, and the middle one is why this is not just ``skill_names``:
+
+    * Skills named by the workflow -> that exact list. An explicit
+      ``skills:``/``plugins:`` declaration is the allowlist; settings-tier
+      discovery does not widen what the author asked for.
+    * No named skills but a non-empty ``setting_sources`` -> ``"all"``. The
+      CLI discovers skills from the enabled tiers and they never appear in
+      ``skill_names``, so ``[]`` would permit nothing: the model would see the
+      repo's skills in its listing (which this filter does not suppress) and
+      every call would fail with "not in this session's skills allowlist".
+      ``"all"`` resolves to precisely what the enabled tiers found — the set
+      enabling them asked for.
+    * Neither -> ``[]``, an honest opt-out that enables nothing.
+
+    Returns:
+        ``skill_names``, the literal ``"all"``, or ``[]``.
+    """
+    if skill_names:
+        return skill_names
+    if setting_sources:
+        return "all"
+    return []
+
+
 def _server_filter_denials(enumerated: set[str], filters: dict[str, set[str]]) -> list[str]:
     """Names to deny so each filtered server exposes only its listed tools.
 
@@ -1029,7 +1056,18 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # `skills: []` an honest opt-out. Note this is a context filter, not
             # a sandbox: unlisted skills are hidden from the model's listing and
             # rejected by the Skill tool, but their files stay readable on disk.
-            skills=skill_names,
+            #
+            # `"all"` when the workflow opted into settings-tier discovery and
+            # named no skills itself. This is a SECOND gate, distinct from the
+            # `Skill` tool grant in `_resolve_tool_config`: a session can hold
+            # the tool and still have every call rejected. Skills discovered
+            # from a settings tier never pass through `skill_names`, so sending
+            # `[]` there permits nothing — the model lists the repo's skills
+            # (the listing leaks past this filter) and every invocation comes
+            # back "not in this session's skills allowlist". `"all"` widens the
+            # filter to exactly what the enabled tiers discovered, which is the
+            # set the workflow asked for by enabling them.
+            skills=_resolve_skill_filter(skill_names, self._setting_sources),
             # Unlike `skills`, [] is already this field's default and means
             # nothing special.
             plugins=skill_plugins,

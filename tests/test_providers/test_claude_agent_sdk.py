@@ -2343,6 +2343,56 @@ class TestSettingSourcesWiring:
         # The declared tools survive alongside it.
         assert "mcp__filesystem__read_text_file" in captured["allowed"]
 
+    def test_skill_filter_widens_to_all_only_for_discovery(self) -> None:
+        """``skills`` is a SECOND gate after the ``Skill`` tool grant. Sending
+        ``[]`` while a settings tier is enabled permits nothing: the model
+        lists the repo's skills and every call is refused as not in the
+        allowlist."""
+        from conductor.providers.claude_agent_sdk import _resolve_skill_filter
+
+        # A declared allowlist is the author's intent; discovery must not widen it.
+        assert _resolve_skill_filter(["p:a"], []) == ["p:a"]
+        assert _resolve_skill_filter(["p:a"], ["project"]) == ["p:a"]
+        # Discovery with nothing declared: the enabled tiers decide the set.
+        assert _resolve_skill_filter([], ["project"]) == "all"
+        # Neither: an honest opt-out.
+        assert _resolve_skill_filter([], []) == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_sources_permit_discovered_skill_names(self) -> None:
+        """End of the chain: the tool is granted AND the name filter allows it.
+        Regression guard for a session that could call Skill and had every call
+        refused with "not in this session's skills allowlist"."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["skills"] = kwargs["options"].skills
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(setting_sources=["project"])
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["skills"] == "all"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_default_still_enables_no_skills(self) -> None:
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["skills"] = kwargs["options"].skills
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["skills"] == []
+
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_no_sources_no_skills_withholds_the_skill_tool(self) -> None:
         """The default must not quietly widen: with nothing to load, granting
