@@ -2313,6 +2313,61 @@ class TestSettingSourcesWiring:
             provider = await ProviderFactory.create_provider(runtime, validate=False)
         assert provider._setting_sources == []
 
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_sources_grant_the_skill_tool(self) -> None:
+        """Discovered AND enabled. CLI-discovered skills never pass through
+        ``skill_names``, so gating the Skill tool on that alone listed them to
+        the model with no tool to invoke them — discovery without execution."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["allowed"] = kwargs["options"].allowed_tools
+            yield _result(result="ok")
+
+        agent = AgentDef(name="t", prompt="hi", tools=["filesystem__read_text_file"])
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"filesystem": {"type": "stdio", "command": "fs"}},
+                setting_sources=["project"],
+            )
+            # Pre-seed so a non-empty allowlist does not spawn the real server.
+            provider._enumerated_mcp_tools = {"filesystem__read_text_file"}
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=["filesystem__read_text_file"],
+            )
+
+        assert "Skill" in captured["allowed"]
+        # The declared tools survive alongside it.
+        assert "mcp__filesystem__read_text_file" in captured["allowed"]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_no_sources_no_skills_withholds_the_skill_tool(self) -> None:
+        """The default must not quietly widen: with nothing to load, granting
+        Skill would advertise a capability backed by no skill."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["allowed"] = kwargs["options"].allowed_tools
+            yield _result(result="ok")
+
+        agent = AgentDef(name="t", prompt="hi", tools=["filesystem__read_text_file"])
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"filesystem": {"type": "stdio", "command": "fs"}},
+            )
+            provider._enumerated_mcp_tools = {"filesystem__read_text_file"}
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=["filesystem__read_text_file"],
+            )
+
+        assert "Skill" not in captured["allowed"]
+
 
 class TestMcpConfigCleanup:
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)

@@ -954,7 +954,15 @@ class ClaudeAgentSdkProvider(AgentProvider):
         sdk_tools, permission_mode, allowed_tools, disallowed_tools = self._resolve_tool_config(
             tools,
             agent,
-            skills_enabled=bool(skill_names),
+            # Either route to a skill counts. ``skill_names`` covers the ones
+            # Conductor resolved (``skills:``/``plugins:``/discovery); a
+            # non-empty ``setting_sources`` means the CLI does its own
+            # discovery from the session's settings tiers, and those skills are
+            # listed to the model without ever passing through
+            # ``skill_names``. Granting on the union is what stops the second
+            # route from being discovery without execution: the model would see
+            # the skill in its listing and hold no tool to invoke it with.
+            skills_enabled=bool(skill_names) or bool(self._setting_sources),
             agents_enabled=bool(custom_agents),
             enumerated_mcp_tools=enumerated_mcp_tools,
         )
@@ -1666,8 +1674,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
             agent: The agent definition. ``agent.tools`` carries the raw
                 omitted-vs-explicit-empty signal; ``agent.name`` is used in
                 the error message.
-            skills_enabled: Whether this agent has skills to load. Only
-                affects the explicit ``tools: []`` case.
+            skills_enabled: Whether this agent can reach a skill by any
+                route — resolved by Conductor (``skills:``/``plugins:``/
+                discovery) *or* discovered by the CLI itself from a non-empty
+                ``setting_sources``. Adds the ``Skill`` tool: to an explicit
+                ``tools: []`` as its one carve-out, and to a non-empty
+                allowlist alongside the tools the agent declared. Without it
+                a listed skill is unusable — visible to the model with no
+                tool to invoke it.
             enumerated_mcp_tools: Every ``<server>__<tool>`` the declared servers
                 expose, used to compute the complement to deny.
 
