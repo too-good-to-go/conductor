@@ -3180,10 +3180,35 @@ class TestDialogTurn:
             )
 
         assert answer == "What are the acceptance criteria?"
-        # A dialog turn is text-in/text-out: no tools, no ambient config.
+        # A dialog turn is text-in/text-out: no tools, and nothing ambient
+        # unless the workflow asked for it (see the test below).
         assert captured["options"].tools == []
         assert captured["options"].setting_sources == []
         assert "earlier turn" in captured["prompt"]
+
+    async def test_declared_setting_sources_reach_the_dialog_turn(self) -> None:
+        """A dialog turn honours the workflow's tiers, like ``execute`` does.
+
+        This hardcoded ``[]`` while ``execute`` read ``self._setting_sources``,
+        so a workflow opting into ``setting_sources: [project]`` still had its
+        dialog prompts phrased without the target repo's CLAUDE.md or rules.
+        """
+        from claude_agent_sdk import TextBlock
+
+        captured: dict = {}
+
+        async def fake_query(prompt, options):
+            captured["options"] = options
+            yield _assistant([TextBlock(text="q?")])
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(setting_sources=["project"])
+            await provider.execute_dialog_turn(system_prompt="sys", user_message="ask")
+
+        assert captured["options"].setting_sources == ["project"]
+        # Tiers in scope must not smuggle skills in: `tools=[]` grants no
+        # Skill tool, so a discovered skill stays uninvokable here.
+        assert captured["options"].tools == []
 
     async def test_plugin_http_server_is_refused(self) -> None:
         """A per-agent plugin's servers must be enumerated too.

@@ -1420,10 +1420,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
             system_prompt=system_prompt,
             max_turns=1,
             tools=[],
-            # Same reasoning as `execute`: without these the CLI loads ambient
-            # MCP servers, settings and skills the workflow never declared.
+            # strict_mcp_config: same reasoning as `execute` — without it the CLI
+            # loads ambient MCP servers the workflow never declared. Tools are
+            # off here, so this only guards against the servers themselves.
             strict_mcp_config=True,
-            setting_sources=[],
+            # Honour the workflow's declared tiers, like `execute` does. A
+            # workflow that opts into `setting_sources: [project]` for its target
+            # repo means it for its dialog prompts too: the CLAUDE.md and rules
+            # that shape the phrasing of a question are the same ones that shape
+            # the work. Still defaults to `[]`, so nothing ambient loads unless
+            # asked. Skills stay off regardless — `tools=[]` grants no Skill tool.
+            setting_sources=self._setting_sources,
         )
 
         parts: list[str] = []
