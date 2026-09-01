@@ -2244,6 +2244,182 @@ class TestMcpOptionsWiring:
         # .mcp.json / user-global / plugin servers.
         assert captured["strict"] is True
 
+
+class TestSettingSourcesWiring:
+    """``runtime.provider.setting_sources`` decides what ambient Claude Code
+    settings a session may load. Empty by default; opt-in per workflow."""
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_default_sends_an_explicit_empty_list(self) -> None:
+        """``[]`` and ``None`` are NOT interchangeable: the SDK re-defaults an
+        unset value to ``["user", "project"]`` whenever ``skills`` is set, so
+        the empty list has to reach the CLI explicitly."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["sources"] = kwargs["options"].setting_sources
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["sources"] == []
+        assert captured["sources"] is not None
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_sources_reach_the_sdk(self) -> None:
+        """The opt-in case: an agent whose working_dir is a target repo that
+        ships its own ``.claude/skills``, which no plugin root packages."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["sources"] = kwargs["options"].setting_sources
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(setting_sources=["project"])
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["sources"] == ["project"]
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_explicit_none_is_normalised_to_empty(self) -> None:
+        """An unset YAML field arrives as ``None`` and must not become the
+        SDK's own default."""
+        assert ClaudeAgentSdkProvider(setting_sources=None)._setting_sources == []
+
+    async def test_factory_forwards_the_field_from_provider_settings(self) -> None:
+        from conductor.config.schema import ProviderSettings, RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(
+            provider=ProviderSettings(name="claude-agent-sdk", setting_sources=["project"])
+        )
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = await ProviderFactory.create_provider(runtime, validate=False)
+        assert provider._setting_sources == ["project"]
+
+    async def test_factory_defaults_to_no_ambient_sources(self) -> None:
+        from conductor.config.schema import ProviderSettings, RuntimeConfig
+        from conductor.providers.factory import ProviderFactory
+
+        runtime = RuntimeConfig(provider=ProviderSettings(name="claude-agent-sdk"))
+        with patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True):
+            provider = await ProviderFactory.create_provider(runtime, validate=False)
+        assert provider._setting_sources == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_sources_grant_the_skill_tool(self) -> None:
+        """Discovered AND enabled. CLI-discovered skills never pass through
+        ``skill_names``, so gating the Skill tool on that alone listed them to
+        the model with no tool to invoke them — discovery without execution."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["allowed"] = kwargs["options"].allowed_tools
+            yield _result(result="ok")
+
+        agent = AgentDef(name="t", prompt="hi", tools=["filesystem__read_text_file"])
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"filesystem": {"type": "stdio", "command": "fs"}},
+                setting_sources=["project"],
+            )
+            # Pre-seed so a non-empty allowlist does not spawn the real server.
+            provider._enumerated_mcp_tools = {"filesystem__read_text_file"}
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=["filesystem__read_text_file"],
+            )
+
+        assert "Skill" in captured["allowed"]
+        # The declared tools survive alongside it.
+        assert "mcp__filesystem__read_text_file" in captured["allowed"]
+
+    def test_skill_filter_widens_to_all_only_for_discovery(self) -> None:
+        """``skills`` is a SECOND gate after the ``Skill`` tool grant. Sending
+        ``[]`` while a settings tier is enabled permits nothing: the model
+        lists the repo's skills and every call is refused as not in the
+        allowlist."""
+        from conductor.providers.claude_agent_sdk import _resolve_skill_filter
+
+        # A declared allowlist is the author's intent; discovery must not widen it.
+        assert _resolve_skill_filter(["p:a"], []) == ["p:a"]
+        assert _resolve_skill_filter(["p:a"], ["project"]) == ["p:a"]
+        # Discovery with nothing declared: the enabled tiers decide the set.
+        assert _resolve_skill_filter([], ["project"]) == "all"
+        # Neither: an honest opt-out.
+        assert _resolve_skill_filter([], []) == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_declared_sources_permit_discovered_skill_names(self) -> None:
+        """End of the chain: the tool is granted AND the name filter allows it.
+        Regression guard for a session that could call Skill and had every call
+        refused with "not in this session's skills allowlist"."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["skills"] = kwargs["options"].skills
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(setting_sources=["project"])
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["skills"] == "all"
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_default_still_enables_no_skills(self) -> None:
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["skills"] = kwargs["options"].skills
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(name="t", prompt="hi"), context={}, rendered_prompt="hi"
+            )
+
+        assert captured["skills"] == []
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_no_sources_no_skills_withholds_the_skill_tool(self) -> None:
+        """The default must not quietly widen: with nothing to load, granting
+        Skill would advertise a capability backed by no skill."""
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["allowed"] = kwargs["options"].allowed_tools
+            yield _result(result="ok")
+
+        agent = AgentDef(name="t", prompt="hi", tools=["filesystem__read_text_file"])
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"filesystem": {"type": "stdio", "command": "fs"}},
+            )
+            provider._enumerated_mcp_tools = {"filesystem__read_text_file"}
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=["filesystem__read_text_file"],
+            )
+
+        assert "Skill" not in captured["allowed"]
+
+
+class TestMcpConfigCleanup:
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_config_file_removed_when_query_raises(self) -> None:
         captured: dict = {}
@@ -3004,10 +3180,35 @@ class TestDialogTurn:
             )
 
         assert answer == "What are the acceptance criteria?"
-        # A dialog turn is text-in/text-out: no tools, no ambient config.
+        # A dialog turn is text-in/text-out: no tools, and nothing ambient
+        # unless the workflow asked for it (see the test below).
         assert captured["options"].tools == []
         assert captured["options"].setting_sources == []
         assert "earlier turn" in captured["prompt"]
+
+    async def test_declared_setting_sources_reach_the_dialog_turn(self) -> None:
+        """A dialog turn honours the workflow's tiers, like ``execute`` does.
+
+        This hardcoded ``[]`` while ``execute`` read ``self._setting_sources``,
+        so a workflow opting into ``setting_sources: [project]`` still had its
+        dialog prompts phrased without the target repo's CLAUDE.md or rules.
+        """
+        from claude_agent_sdk import TextBlock
+
+        captured: dict = {}
+
+        async def fake_query(prompt, options):
+            captured["options"] = options
+            yield _assistant([TextBlock(text="q?")])
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(setting_sources=["project"])
+            await provider.execute_dialog_turn(system_prompt="sys", user_message="ask")
+
+        assert captured["options"].setting_sources == ["project"]
+        # Tiers in scope must not smuggle skills in: `tools=[]` grants no
+        # Skill tool, so a discovered skill stays uninvokable here.
+        assert captured["options"].tools == []
 
     async def test_plugin_http_server_is_refused(self) -> None:
         """A per-agent plugin's servers must be enumerated too.

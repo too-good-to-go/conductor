@@ -2666,6 +2666,39 @@ class ProviderSettings(BaseModel):
     headers: dict[str, str] | None = None
     """Extra HTTP headers to send with every request. Copilot-only."""
 
+    setting_sources: list[Literal["user", "project", "local"]] | None = None
+    """Claude Code settings tiers the session may load. claude-agent-sdk-only.
+
+    Defaults to ``None``, which Conductor sends to the CLI as ``[]`` — load
+    nothing ambient. That default is the skills counterpart of
+    ``strict_mcp_config``: a workflow gets the skills, instructions and hooks
+    it *declares*, never whatever the machine running it happens to have
+    installed, so a run reproduces on another developer's laptop.
+
+    Set it to opt a workflow back in. The motivating case is an agent working
+    inside a *target* repository that ships its own ``.claude/skills`` — with
+    ``working_dir`` pointed at that repo, ``["project"]`` loads that repo's
+    skills and instructions natively, without the repo needing to package
+    them as a Claude Code plugin (the CLI has ``--plugin-dir`` but no
+    ``--skill-dir``, so a plugin root is otherwise the only handle).
+
+    Each tier brings everything that tier defines, hooks included: ``project``
+    reads ``<cwd>/.claude/settings.json``, whose ``hooks`` entries run
+    commands. Enable it only for repositories trusted to the same degree as
+    the workflow itself.
+
+    ``user`` additionally reads ``~/.claude/settings.json``, which makes a run
+    depend on the operator's personal machine — reproducible only by
+    accident. Prefer ``["project"]``.
+
+    Example::
+
+        runtime:
+          provider:
+            name: claude-agent-sdk
+            setting_sources: [project]
+    """
+
     azure: AzureProviderOptions | None = None
     """Azure-specific options (e.g. ``api_version``). Requires
     ``type: azure``. Copilot-only."""

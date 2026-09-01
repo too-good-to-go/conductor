@@ -319,6 +319,33 @@ def _stdio_path_args(mcp_servers: dict[str, Any]) -> list[str]:
     return sorted(set(paths))
 
 
+def _resolve_skill_filter(skill_names: list[str], setting_sources: list[str]) -> list[str] | str:
+    """Value for ``ClaudeAgentOptions.skills`` — the name-level skill filter.
+
+    Three cases, and the middle one is why this is not just ``skill_names``:
+
+    * Skills named by the workflow -> that exact list. An explicit
+      ``skills:``/``plugins:`` declaration is the allowlist; settings-tier
+      discovery does not widen what the author asked for.
+    * No named skills but a non-empty ``setting_sources`` -> ``"all"``. The
+      CLI discovers skills from the enabled tiers and they never appear in
+      ``skill_names``, so ``[]`` would permit nothing: the model would see the
+      repo's skills in its listing (which this filter does not suppress) and
+      every call would fail with "not in this session's skills allowlist".
+      ``"all"`` resolves to precisely what the enabled tiers found — the set
+      enabling them asked for.
+    * Neither -> ``[]``, an honest opt-out that enables nothing.
+
+    Returns:
+        ``skill_names``, the literal ``"all"``, or ``[]``.
+    """
+    if skill_names:
+        return skill_names
+    if setting_sources:
+        return "all"
+    return []
+
+
 def _server_filter_denials(enumerated: set[str], filters: dict[str, set[str]]) -> list[str]:
     """Names to deny so each filtered server exposes only its listed tools.
 
@@ -691,6 +718,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         max_turns: int | None = None,
         max_session_seconds: float | None = None,
         mcp_servers: dict[str, Any] | None = None,
+        setting_sources: list[str] | None = None,
     ) -> None:
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             raise ProviderError(
@@ -698,6 +726,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 suggestion=f"Install with: {install_command('claude-agent-sdk')}",
             )
 
+        # ``None`` becomes ``[]`` — load nothing ambient. Not cosmetic: the SDK
+        # re-defaults an unset ``setting_sources`` to ``["user", "project"]``
+        # whenever ``skills`` is set, so the empty list must be sent explicitly.
+        # See the option block in ``execute``.
+        self._setting_sources: list[str] = list(setting_sources or [])
         self._default_model = model or _DEFAULT_MODEL
         self._default_max_turns = max_turns if max_turns is not None else 50
         self._max_session_seconds = max_session_seconds
@@ -948,7 +981,15 @@ class ClaudeAgentSdkProvider(AgentProvider):
         sdk_tools, permission_mode, allowed_tools, disallowed_tools = self._resolve_tool_config(
             tools,
             agent,
-            skills_enabled=bool(skill_names),
+            # Either route to a skill counts. ``skill_names`` covers the ones
+            # Conductor resolved (``skills:``/``plugins:``/discovery); a
+            # non-empty ``setting_sources`` means the CLI does its own
+            # discovery from the session's settings tiers, and those skills are
+            # listed to the model without ever passing through
+            # ``skill_names``. Granting on the union is what stops the second
+            # route from being discovery without execution: the model would see
+            # the skill in its listing and hold no tool to invoke it with.
+            skills_enabled=bool(skill_names) or bool(self._setting_sources),
             agents_enabled=bool(custom_agents),
             enumerated_mcp_tools=enumerated_mcp_tools,
         )
@@ -986,16 +1027,28 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # plugin-provided servers, and permission_mode bypasses approval
             # for whatever they expose. Only declared servers may attach.
             strict_mcp_config=True,
-            # The skills counterpart of strict_mcp_config, and unconditional
-            # for the same reason: left unset, the CLI loads user settings
-            # (~/.claude/settings.json), project settings (.claude/settings.json)
-            # and local settings — which between them bring in ambient skills,
-            # CLAUDE.md, and hooks the workflow never declared. Setting `skills`
-            # makes this doubly load-bearing: the SDK re-defaults setting_sources
-            # to ["user", "project"] whenever `skills` is set and this is None.
-            # Conductor surfaces instruction files through its own opt-in
-            # `--workspace-instructions`; settings and hooks have no equivalent.
-            setting_sources=[],
+            # The skills counterpart of strict_mcp_config, and empty by
+            # DEFAULT for the same reason: left unset, the CLI loads user
+            # settings (~/.claude/settings.json), project settings
+            # (.claude/settings.json) and local settings — which between them
+            # bring in ambient skills, CLAUDE.md, and hooks the workflow never
+            # declared. Setting `skills` makes this doubly load-bearing: the
+            # SDK re-defaults setting_sources to ["user", "project"] whenever
+            # `skills` is set and this is None, so [] must be explicit.
+            #
+            # Opt back in per workflow with `runtime.provider.setting_sources`.
+            # The case it exists for: an agent whose `working_dir` is a TARGET
+            # repository that ships its own `.claude/skills`. The CLI has
+            # `--plugin-dir` but no `--skill-dir`, so without this a repo must
+            # package its skills as a Claude Code plugin to be reachable at
+            # all. `["project"]` reads them straight from the repo — and the
+            # repo's CLAUDE.md/AGENTS.md with them, which `--workspace-
+            # instructions` cannot do per-step (it resolves one directory
+            # before the first step runs).
+            #
+            # A tier brings everything it defines, hooks included, so this is
+            # only for repositories trusted as much as the workflow itself.
+            setting_sources=self._setting_sources,
             # Load-bearing but invisible in argv: the SDK forwards an explicit
             # list in the `initialize` control request (_internal/query.py), and
             # only there does [] differ from None. None means "CLI defaults
@@ -1003,7 +1056,18 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # `skills: []` an honest opt-out. Note this is a context filter, not
             # a sandbox: unlisted skills are hidden from the model's listing and
             # rejected by the Skill tool, but their files stay readable on disk.
-            skills=skill_names,
+            #
+            # `"all"` when the workflow opted into settings-tier discovery and
+            # named no skills itself. This is a SECOND gate, distinct from the
+            # `Skill` tool grant in `_resolve_tool_config`: a session can hold
+            # the tool and still have every call rejected. Skills discovered
+            # from a settings tier never pass through `skill_names`, so sending
+            # `[]` there permits nothing — the model lists the repo's skills
+            # (the listing leaks past this filter) and every invocation comes
+            # back "not in this session's skills allowlist". `"all"` widens the
+            # filter to exactly what the enabled tiers discovered, which is the
+            # set the workflow asked for by enabling them.
+            skills=_resolve_skill_filter(skill_names, self._setting_sources),
             # Unlike `skills`, [] is already this field's default and means
             # nothing special.
             plugins=skill_plugins,
@@ -1356,10 +1420,17 @@ class ClaudeAgentSdkProvider(AgentProvider):
             system_prompt=system_prompt,
             max_turns=1,
             tools=[],
-            # Same reasoning as `execute`: without these the CLI loads ambient
-            # MCP servers, settings and skills the workflow never declared.
+            # strict_mcp_config: same reasoning as `execute` — without it the CLI
+            # loads ambient MCP servers the workflow never declared. Tools are
+            # off here, so this only guards against the servers themselves.
             strict_mcp_config=True,
-            setting_sources=[],
+            # Honour the workflow's declared tiers, like `execute` does. A
+            # workflow that opts into `setting_sources: [project]` for its target
+            # repo means it for its dialog prompts too: the CLAUDE.md and rules
+            # that shape the phrasing of a question are the same ones that shape
+            # the work. Still defaults to `[]`, so nothing ambient loads unless
+            # asked. Skills stay off regardless — `tools=[]` grants no Skill tool.
+            setting_sources=self._setting_sources,
         )
 
         parts: list[str] = []
@@ -1648,8 +1719,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
             agent: The agent definition. ``agent.tools`` carries the raw
                 omitted-vs-explicit-empty signal; ``agent.name`` is used in
                 the error message.
-            skills_enabled: Whether this agent has skills to load. Only
-                affects the explicit ``tools: []`` case.
+            skills_enabled: Whether this agent can reach a skill by any
+                route — resolved by Conductor (``skills:``/``plugins:``/
+                discovery) *or* discovered by the CLI itself from a non-empty
+                ``setting_sources``. Adds the ``Skill`` tool: to an explicit
+                ``tools: []`` as its one carve-out, and to a non-empty
+                allowlist alongside the tools the agent declared. Without it
+                a listed skill is unusable — visible to the model with no
+                tool to invoke it.
             enumerated_mcp_tools: Every ``<server>__<tool>`` the declared servers
                 expose, used to compute the complement to deny.
 
