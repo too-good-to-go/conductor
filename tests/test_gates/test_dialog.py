@@ -477,7 +477,7 @@ class TestWebDialogFlow:
 
     @pytest.mark.asyncio
     async def test_dismiss_keyword_exits_at_approval_prompt(self) -> None:
-        """"done" ends a genuine proposal, not just yes/y/empty."""
+        """ "done" ends a genuine proposal, not just yes/y/empty."""
         handler, _ = self._make_handler(
             [
                 {"type": "dialog_message", "content": "answer one"},
@@ -842,3 +842,86 @@ class TestDialogNonAsciiOutput:
         assert any("你好 мир" in body for body in markdown_bodies)
         assert all("\\u4f60" not in body for body in markdown_bodies)
         assert all("\\u043f" not in body for body in markdown_bodies)
+
+
+class TestDialogMultilineInput:
+    """Terminal dialog turns must accept pasted multi-line blocks (AC1/AC3/AC4/AC5)."""
+
+    @pytest.mark.asyncio
+    async def test_pasted_block_is_one_user_prompt_with_newlines(self) -> None:
+        """A pasted block is ingested as ONE prompt with internal newlines intact."""
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch(
+                "builtins.input",
+                side_effect=["line one", "line two", "line three", "/send", "done"],
+            ),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        user_msgs = [m for m in result.messages if m.role == "user"]
+        # Exactly one paste ingested as a single prompt, both newlines intact:
+        assert user_msgs[0].content == "line one\nline two\nline three"
+        provider.execute_dialog_turn.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_eof_mid_paste_submits_content_not_dismissal(self) -> None:
+        """EOF (Ctrl-D) mid-paste dispatches accumulated content, not dismissal."""
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            # Paste, then Ctrl-D (EOF) instead of /send; then a real dismissal.
+            patch("builtins.input", side_effect=["ticket text", EOFError(), "done"]),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        user_msgs = [m for m in result.messages if m.role == "user"]
+        assert user_msgs[0].content == "ticket text"  # not dropped as None
+        provider.execute_dialog_turn.assert_awaited()  # the turn WAS dispatched
+
+    @pytest.mark.asyncio
+    async def test_web_path_unaffected_by_multiline(self) -> None:
+        """The web seam still passes whole messages through, never via the new reader."""
+        dashboard = MagicMock()
+        dashboard.wait_for_dialog_message = AsyncMock(
+            side_effect=[
+                {"type": "dialog_message", "agent_name": "test", "content": "a\nb\nc"},
+                {"type": "dialog_decline", "agent_name": "test"},
+            ]
+        )
+        handler = DialogHandler(console=MagicMock(), web_dashboard=dashboard)
+        agent = AgentDef(name="test", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+
+        with patch(
+            "conductor.gates.dialog.read_multiline_lines",
+            side_effect=AssertionError("must not be called on the web path"),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+
+        user_msgs = [m for m in result.messages if m.role == "user"]
+        assert user_msgs[0].content == "a\nb\nc"
+        assert result.user_dismissed is True

@@ -32,10 +32,48 @@ if TYPE_CHECKING:
 MULTILINE_SENTINEL = "."
 """Line that terminates a multi-line answer when typed on its own."""
 
+DIALOG_SUBMIT_SENTINEL = "/send"
+"""Line that submits a multi-line dialog turn; prose-safe vs a lone '.'."""
+
 
 def _eof_key_hint() -> str:
     """Return the platform-appropriate EOF keystroke for display."""
     return "Ctrl-Z then Enter" if sys.platform == "win32" else "Ctrl-D"
+
+
+def read_multiline_lines(console: MarkupFreeConsole, sentinel: str = MULTILINE_SENTINEL) -> str:
+    """Read a multi-line answer from stdin (blocking; call on a thread).
+
+    Terminates on a line whose stripped text equals ``sentinel`` or on EOF.
+    Internal newlines are preserved; trailing blank lines are stripped.
+
+    Args:
+        console: Console to print the input hint to.
+        sentinel: Line that, typed alone, submits the accumulated text.
+
+    Returns:
+        The collected text with trailing blank lines stripped.
+    """
+    console.print(
+        styled(
+            "  [dim]Enter your answer. Finish with '{}' on its own line (or {}).[/dim]",
+            sentinel,
+            _eof_key_hint(),
+        )
+    )
+    lines: list[str] = []
+    while True:
+        try:
+            line = input()
+        except (EOFError, StopIteration):
+            # StopIteration only ever arises from a test double's exhausted
+            # ``side_effect`` list (real ``input()`` never raises it) --
+            # treated the same as EOF: submit what has been accumulated.
+            break
+        if line.strip() == sentinel:
+            break
+        lines.append(line)
+    return "\n".join(lines).rstrip("\n")
 
 
 async def read_on_daemon_thread[T](fn: Callable[[], T]) -> T:
@@ -477,30 +515,14 @@ class HumanGateHandler:
     def _read_multiline(self) -> str:
         """Read a multi-line answer from stdin (blocking; call in a thread).
 
-        Terminates on a line containing only ``.`` or on EOF. The sentinel is
-        listed first in the hint because Ctrl-D/Ctrl-Z differs by platform.
+        Delegates to the shared :func:`read_multiline_lines` with this gate's
+        historical ``.`` sentinel, so behavior is unchanged by the extraction.
 
         Returns:
             The collected text with trailing blank lines stripped. Internal
             newlines are preserved.
         """
-        self.console.print(
-            styled(
-                "  [dim]Enter your answer. Finish with '{}' on its own line (or {}).[/dim]",
-                MULTILINE_SENTINEL,
-                _eof_key_hint(),
-            )
-        )
-        lines: list[str] = []
-        while True:
-            try:
-                line = input()
-            except EOFError:
-                break
-            if line.strip() == MULTILINE_SENTINEL:
-                break
-            lines.append(line)
-        return "\n".join(lines).rstrip("\n")
+        return read_multiline_lines(self.console, MULTILINE_SENTINEL)
 
 
 @dataclass

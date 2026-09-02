@@ -9,7 +9,7 @@ import pytest
 
 from conductor.config.schema import AgentDef, GateOption
 from conductor.exceptions import HumanGateError
-from conductor.gates.human import GateResult, HumanGateHandler
+from conductor.gates.human import GateResult, HumanGateHandler, read_multiline_lines
 
 
 @pytest.fixture
@@ -752,3 +752,31 @@ class TestDaemonThreadReader:
         from conductor.gates.human import read_on_daemon_thread
 
         assert await asyncio.wait_for(read_on_daemon_thread(lambda: "ok"), timeout=5) == "ok"
+
+
+class TestReadMultilineLines:
+    """Regression tests for the extracted module-level multi-line reader."""
+
+    def test_read_multiline_lines_preserves_internal_newlines(self) -> None:
+        """Extracting the helper must not change behavior or drop newlines."""
+        with patch(
+            "builtins.input",
+            side_effect=["line one", "line two", "line three", "."],
+        ):
+            result = read_multiline_lines(MagicMock())
+
+        assert result == "line one\nline two\nline three"
+
+    def test_read_multiline_lines_custom_sentinel(self) -> None:
+        """A lone '.' is not a submit under a custom sentinel (AC3)."""
+        with patch("builtins.input", side_effect=[".", "still going", "/send"]):
+            result = read_multiline_lines(MagicMock(), sentinel="/send")
+
+        assert result == ".\nstill going"
+
+    def test_read_multiline_lines_eof_returns_accumulated(self) -> None:
+        """EOF submits accumulated content, not empty (feeds AC4)."""
+        with patch("builtins.input", side_effect=["a", "b", EOFError()]):
+            result = read_multiline_lines(MagicMock())
+
+        assert result == "a\nb"

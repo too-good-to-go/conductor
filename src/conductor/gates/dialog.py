@@ -23,6 +23,11 @@ from rich.text import Text
 
 from conductor.console import MarkupFreeConsole, make_console, styled
 from conductor.executor.linkify import linkify_markdown
+from conductor.gates.human import (
+    DIALOG_SUBMIT_SENTINEL,
+    read_multiline_lines,
+    read_on_daemon_thread,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -282,6 +287,11 @@ class DialogHandler:
                 # EOF or error
                 result.user_dismissed = True
                 break
+
+            if user_input == "":
+                # User submitted nothing on a tty (e.g. an accidental bare
+                # sentinel line) -- not a turn, and not dismissal either.
+                continue
 
             result.messages.append(DialogMessage(role="user", content=user_input))
             self._emit_event(
@@ -761,8 +771,17 @@ class DialogHandler:
                 passing an interpolated f-string here.
 
         Returns:
-            User input text, or None on EOF/error.
+            User input text, or None on genuine no-input (non-tty EOF or
+            KeyboardInterrupt). The main turn (``prompt_text is None`` on a
+            tty) reads multi-line and returns accumulated content even on
+            EOF mid-paste, rather than treating that EOF as dismissal.
         """
+        if prompt_text is None and sys.stdin.isatty():
+            self.console.print(styled("[bold magenta]You[/bold magenta]"))
+            return await read_on_daemon_thread(
+                lambda: read_multiline_lines(self.console, DIALOG_SUBMIT_SENTINEL)
+            )
+
         prompt = styled("[bold magenta]You[/bold magenta]") if prompt_text is None else prompt_text
         try:
 
