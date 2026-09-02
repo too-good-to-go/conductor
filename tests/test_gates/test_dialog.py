@@ -897,6 +897,55 @@ class TestDialogMultilineInput:
         provider.execute_dialog_turn.assert_awaited()  # the turn WAS dispatched
 
     @pytest.mark.asyncio
+    async def test_ctrl_d_at_empty_prompt_dismisses(self) -> None:
+        """A deliberate Ctrl-D with nothing typed ends the dialog.
+
+        Regression: the multi-line reader converts EOF into a returned string,
+        so an empty read must not be fed back round the loop -- otherwise the
+        dismissal branch is unreachable and the grill cannot be exited.
+        """
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        # A bounded list: if the loop spins, input() raises StopIteration
+        # rather than hanging the suite.
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=EOFError()),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        assert result.user_dismissed is True
+        assert [m for m in result.messages if m.role == "user"] == []
+        provider.execute_dialog_turn.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_ctrl_c_dismisses_rather_than_propagating(self) -> None:
+        """KeyboardInterrupt on the tty turn dismisses, as on the single-line path."""
+        handler = DialogHandler(console=MagicMock())
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+        provider = MagicMock()
+        provider.execute_dialog_turn = AsyncMock(return_value="ack")
+        with (
+            patch.object(handler, "_ask_engagement", new_callable=AsyncMock, return_value="engage"),
+            patch("conductor.gates.dialog.sys.stdin.isatty", return_value=True),
+            patch("builtins.input", side_effect=KeyboardInterrupt()),
+        ):
+            result = await handler.handle_dialog(
+                agent=agent,
+                agent_output={"result": "x"},
+                opening_question="Q?",
+                provider=provider,
+            )
+        assert result.user_dismissed is True
+
+    @pytest.mark.asyncio
     async def test_web_path_unaffected_by_multiline(self) -> None:
         """The web seam still passes whole messages through, never via the new reader."""
         dashboard = MagicMock()

@@ -41,7 +41,9 @@ def _eof_key_hint() -> str:
     return "Ctrl-Z then Enter" if sys.platform == "win32" else "Ctrl-D"
 
 
-def read_multiline_lines(console: MarkupFreeConsole, sentinel: str = MULTILINE_SENTINEL) -> str:
+def read_multiline_lines(
+    console: MarkupFreeConsole, sentinel: str = MULTILINE_SENTINEL
+) -> tuple[str, bool]:
     """Read a multi-line answer from stdin (blocking; call on a thread).
 
     Terminates on a line whose stripped text equals ``sentinel`` or on EOF.
@@ -52,7 +54,11 @@ def read_multiline_lines(console: MarkupFreeConsole, sentinel: str = MULTILINE_S
         sentinel: Line that, typed alone, submits the accumulated text.
 
     Returns:
-        The collected text with trailing blank lines stripped.
+        ``(text, hit_eof)`` -- the collected text with trailing blank lines
+        stripped, and whether the read ended at EOF rather than at the
+        sentinel. Callers need the distinction because an EOF that yielded no
+        text is a deliberate dismissal (Ctrl-D at an empty prompt), whereas
+        the sentinel with no text is merely an empty submission.
     """
     console.print(
         styled(
@@ -62,6 +68,7 @@ def read_multiline_lines(console: MarkupFreeConsole, sentinel: str = MULTILINE_S
         )
     )
     lines: list[str] = []
+    hit_eof = False
     while True:
         try:
             line = input()
@@ -69,11 +76,12 @@ def read_multiline_lines(console: MarkupFreeConsole, sentinel: str = MULTILINE_S
             # StopIteration only ever arises from a test double's exhausted
             # ``side_effect`` list (real ``input()`` never raises it) --
             # treated the same as EOF: submit what has been accumulated.
+            hit_eof = True
             break
         if line.strip() == sentinel:
             break
         lines.append(line)
-    return "\n".join(lines).rstrip("\n")
+    return "\n".join(lines).rstrip("\n"), hit_eof
 
 
 async def read_on_daemon_thread[T](fn: Callable[[], T]) -> T:
@@ -522,7 +530,8 @@ class HumanGateHandler:
             The collected text with trailing blank lines stripped. Internal
             newlines are preserved.
         """
-        return read_multiline_lines(self.console, MULTILINE_SENTINEL)
+        text, _ = read_multiline_lines(self.console, MULTILINE_SENTINEL)
+        return text
 
 
 @dataclass

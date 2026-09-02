@@ -771,16 +771,24 @@ class DialogHandler:
                 passing an interpolated f-string here.
 
         Returns:
-            User input text, or None on genuine no-input (non-tty EOF or
-            KeyboardInterrupt). The main turn (``prompt_text is None`` on a
-            tty) reads multi-line and returns accumulated content even on
-            EOF mid-paste, rather than treating that EOF as dismissal.
+            User input text, or None on EOF/error, which the caller treats as
+            dismissal. The main turn (``prompt_text is None`` on a tty) reads
+            multi-line, so an EOF that *terminates a paste* returns the
+            accumulated content rather than dismissing; an EOF with nothing
+            accumulated is a deliberate Ctrl-D and still returns None.
         """
         if prompt_text is None and sys.stdin.isatty():
             self.console.print(styled("[bold magenta]You[/bold magenta]"))
-            return await read_on_daemon_thread(
-                lambda: read_multiline_lines(self.console, DIALOG_SUBMIT_SENTINEL)
-            )
+            try:
+                text, hit_eof = await read_on_daemon_thread(
+                    lambda: read_multiline_lines(self.console, DIALOG_SUBMIT_SENTINEL)
+                )
+            except (EOFError, KeyboardInterrupt):
+                return None
+            if hit_eof and not text:
+                # Ctrl-D at an empty prompt: the user is leaving, not pasting.
+                return None
+            return text
 
         prompt = styled("[bold magenta]You[/bold magenta]") if prompt_text is None else prompt_text
         try:

@@ -763,20 +763,37 @@ class TestReadMultilineLines:
             "builtins.input",
             side_effect=["line one", "line two", "line three", "."],
         ):
-            result = read_multiline_lines(MagicMock())
+            result, hit_eof = read_multiline_lines(MagicMock())
 
         assert result == "line one\nline two\nline three"
+        assert hit_eof is False
 
     def test_read_multiline_lines_custom_sentinel(self) -> None:
         """A lone '.' is not a submit under a custom sentinel (AC3)."""
         with patch("builtins.input", side_effect=[".", "still going", "/send"]):
-            result = read_multiline_lines(MagicMock(), sentinel="/send")
+            result, hit_eof = read_multiline_lines(MagicMock(), sentinel="/send")
 
         assert result == ".\nstill going"
+        assert hit_eof is False
 
     def test_read_multiline_lines_eof_returns_accumulated(self) -> None:
         """EOF submits accumulated content, not empty (feeds AC4)."""
         with patch("builtins.input", side_effect=["a", "b", EOFError()]):
-            result = read_multiline_lines(MagicMock())
+            result, hit_eof = read_multiline_lines(MagicMock())
 
         assert result == "a\nb"
+        assert hit_eof is True
+
+    def test_read_multiline_lines_reports_eof_on_empty_read(self) -> None:
+        """A bare EOF is distinguishable from an empty sentinel submission.
+
+        The dialog gate relies on this to tell a deliberate Ctrl-D (dismiss)
+        from a sentinel typed with nothing above it (not a turn).
+        """
+        with patch("builtins.input", side_effect=EOFError()):
+            text, hit_eof = read_multiline_lines(MagicMock())
+        assert (text, hit_eof) == ("", True)
+
+        with patch("builtins.input", side_effect=["."]):
+            text, hit_eof = read_multiline_lines(MagicMock())
+        assert (text, hit_eof) == ("", False)
