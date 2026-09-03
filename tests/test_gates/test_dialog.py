@@ -10,6 +10,7 @@ import pytest
 
 from conductor.config.schema import AgentDef, DialogConfig
 from conductor.gates.dialog import DialogHandler, DialogResult
+from conductor.gates.human import DIALOG_SUBMIT_SENTINEL
 
 
 class TestDialogHandlerSkip:
@@ -895,6 +896,25 @@ class TestDialogMultilineInput:
         user_msgs = [m for m in result.messages if m.role == "user"]
         assert user_msgs[0].content == "ticket text"  # not dropped as None
         provider.execute_dialog_turn.assert_awaited()  # the turn WAS dispatched
+
+    def test_opening_banner_advertises_the_submit_sentinel(self) -> None:
+        """The banner names the sentinel a turn actually requires.
+
+        Rendered for real, and asserted against the constant rather than a
+        literal, so the banner cannot drift from DIALOG_SUBMIT_SENTINEL.
+        """
+        import io
+
+        from conductor.console import make_console
+
+        buf = io.StringIO()
+        handler = DialogHandler(console=make_console(file=buf, width=300, no_color=True))
+        agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
+
+        handler._display_dialog_start(agent, {"out": 1}, "question?")
+
+        rendered = "".join(buf.getvalue().split())
+        assert "".join(DIALOG_SUBMIT_SENTINEL.split()) in rendered, rendered
 
     @pytest.mark.asyncio
     async def test_ctrl_d_at_empty_prompt_dismisses(self) -> None:

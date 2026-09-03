@@ -645,9 +645,12 @@ class DialogHandler:
                 styled(
                     "[bold]Agent '{}'[/bold] would like to discuss "
                     "its output with you.\n"
-                    "[dim]Type your responses below. Say [bold]done[/bold] or "
-                    "[bold]/done[/bold] when finished.[/dim]",
+                    "[dim]Type your response below; it can span multiple "
+                    "lines. Send it with [bold]{}[/bold] on its own line. "
+                    "Say [bold]done[/bold] or [bold]/done[/bold] when "
+                    "finished.[/dim]",
                     agent.name,
+                    DIALOG_SUBMIT_SENTINEL,
                 ),
                 title=Text.from_markup("[bold magenta]Dialog Mode[/bold magenta]"),
                 border_style="magenta",
