@@ -897,8 +897,13 @@ class TestDialogMultilineInput:
         assert user_msgs[0].content == "ticket text"  # not dropped as None
         provider.execute_dialog_turn.assert_awaited()  # the turn WAS dispatched
 
-    def test_opening_banner_advertises_the_submit_sentinel(self) -> None:
-        """The banner names the sentinel a turn actually requires.
+    @pytest.mark.parametrize("isatty", [True, False])
+    def test_opening_banner_advertises_the_sentinel_only_on_a_tty(self, isatty: bool) -> None:
+        """The banner names the sentinel exactly when a turn requires it.
+
+        Off a tty the turn falls back to the single-line ``Prompt.ask`` branch,
+        where the sentinel does nothing -- so advertising it there would tell
+        the user to type something with no effect.
 
         Rendered for real, and asserted against the constant rather than a
         literal, so the banner cannot drift from DIALOG_SUBMIT_SENTINEL.
@@ -911,10 +916,14 @@ class TestDialogMultilineInput:
         handler = DialogHandler(console=make_console(file=buf, width=300, no_color=True))
         agent = AgentDef(name="t", prompt="p", dialog=DialogConfig(trigger_prompt="t"))
 
-        handler._display_dialog_start(agent, {"out": 1}, "question?")
+        with patch("conductor.gates.dialog.sys.stdin.isatty", return_value=isatty):
+            handler._display_dialog_start(agent, {"out": 1}, "question?")
 
         rendered = "".join(buf.getvalue().split())
-        assert "".join(DIALOG_SUBMIT_SENTINEL.split()) in rendered, rendered
+        needle = "".join(DIALOG_SUBMIT_SENTINEL.split())
+        assert (needle in rendered) is isatty, rendered
+        # The markup must be parsed, not inserted verbatim as a value.
+        assert "[bold]" not in rendered, rendered
 
     @pytest.mark.asyncio
     async def test_ctrl_d_at_empty_prompt_dismisses(self) -> None:

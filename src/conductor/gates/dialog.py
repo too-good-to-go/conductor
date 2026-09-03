@@ -639,18 +639,31 @@ class DialogHandler:
         base_dir: Path | None = None,
     ) -> None:
         """Display the dialog opening with full agent context."""
+        # Gated on the same condition as the multi-line reader in
+        # _get_user_input: off a tty, that turn falls back to a single-line
+        # Prompt.ask and the sentinel does nothing, so advertising it would
+        # instruct the user to type something with no effect. The markup stays
+        # in the template because styled() inserts *values* verbatim.
+        if sys.stdin.isatty():
+            multiline_hint = (
+                " It can span multiple lines; send it with [bold]{}[/bold] on its own line."
+            )
+            hint_args: tuple[object, ...] = (DIALOG_SUBMIT_SENTINEL,)
+        else:
+            multiline_hint = ""
+            hint_args = ()
+
         self.console.print()
         self.console.print(
             Panel(
                 styled(
                     "[bold]Agent '{}'[/bold] would like to discuss "
                     "its output with you.\n"
-                    "[dim]Type your response below; it can span multiple "
-                    "lines. Send it with [bold]{}[/bold] on its own line. "
+                    "[dim]Type your response below." + multiline_hint + " "
                     "Say [bold]done[/bold] or [bold]/done[/bold] when "
                     "finished.[/dim]",
                     agent.name,
-                    DIALOG_SUBMIT_SENTINEL,
+                    *hint_args,
                 ),
                 title=Text.from_markup("[bold magenta]Dialog Mode[/bold magenta]"),
                 border_style="magenta",
