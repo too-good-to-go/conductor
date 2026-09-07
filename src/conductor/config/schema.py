@@ -1358,6 +1358,49 @@ class AgentDef(BaseModel):
     wait/set/terminate/human_gate/workflow step types.
     """
 
+    settings_dir: str | None = None
+    """Directory whose Claude Code *project* settings tier this agent loads.
+
+    Only meaningful on ``claude-agent-sdk`` agents in a workflow that sets
+    ``runtime.provider.setting_sources`` (see
+    :attr:`ProviderSettings.setting_sources`); ignored by every other
+    provider. Resolved by the engine exactly like :attr:`working_dir`
+    (Jinja-rendered, ``~``-expanded, made absolute against the workflow
+    file's directory, ``normpath``-normalised, existence-checked), then
+    forwarded to the SDK as ``ClaudeAgentOptions.add_dirs``. Rejected on
+    wait/set/terminate/human_gate/questions/workflow step types.
+
+    It exists because ``working_dir`` was doing two unrelated jobs. The CLI
+    supports MCP Roots and advertises exactly one root — its cwd — so a
+    filesystem MCP server discards the directories in its own argv and
+    permits cwd alone. That makes cwd the *only* handle on what an agent can
+    read, while it is simultaneously the directory the ``project`` settings
+    tier resolves against. Narrowing cwd onto a target repository to pick up
+    that repository's skills therefore also narrowed the MCP root below any
+    sibling path the step still had to read, and widening it back lost the
+    repository's conventions.
+
+    ``settings_dir`` splits them: the *skills* of every directory named here
+    are discovered and invocable regardless of cwd, so cwd can stay wide
+    enough to contain everything the agent must read.
+
+    The split is not total, and the remainder is deliberate. A directory
+    named here contributes its ``.claude/skills`` and nothing else — not
+    ``CLAUDE.md``, not ``.claude/settings.json`` (so no ``env`` and no
+    ``hooks``), not ``.claude/agents``, all of which continue to follow cwd.
+    Instructions therefore still need ``working_dir`` (or
+    ``--workspace-instructions``); this field is the skills half only.
+
+    Example — a judge reviewing a target repository while reading artifacts
+    from a sibling directory::
+
+        agents:
+          judge:
+            settings_dir: "{{ setup_worktree.output.worktree_path }}"
+            # No working_dir: cwd stays the launch directory, which contains
+            # both the worktree and the artifacts the judge must read.
+    """
+
     stdin: str | None = None
     """Payload written to the script subprocess's stdin (script type only).
 
@@ -2007,6 +2050,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("human_gate agents cannot have 'working_dir'")
+            if self.settings_dir:
+                raise ValueError("human_gate agents cannot have 'settings_dir'")
             if self.session_key is not None:
                 raise ValueError("human_gate agents cannot have 'session_key'")
         elif self.type == "questions":
@@ -2070,6 +2115,8 @@ class AgentDef(BaseModel):
                 raise ValueError("questions agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("questions agents cannot have 'working_dir'")
+            if self.settings_dir:
+                raise ValueError("questions agents cannot have 'settings_dir'")
             if self.session_key is not None:
                 raise ValueError("questions agents cannot have 'session_key'")
         elif self.type == "script":
@@ -2103,6 +2150,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'validator'")
             if self.sandbox is not None:
                 raise ValueError("script agents cannot have 'sandbox'")
+            if self.settings_dir:
+                raise ValueError("script agents cannot have 'settings_dir'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
@@ -2169,6 +2218,8 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("workflow agents cannot have 'working_dir'")
+            if self.settings_dir:
+                raise ValueError("workflow agents cannot have 'settings_dir'")
         elif self.type == "wait":
             if self.duration is None:
                 raise ValueError("wait agents require 'duration'")
@@ -2192,6 +2243,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("wait agents cannot have 'working_dir'")
+            if self.settings_dir:
+                raise ValueError("wait agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("wait agents cannot have 'timeout'")
             if self.workflow:
@@ -2265,6 +2318,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("set agents cannot have 'working_dir'")
+            if self.settings_dir:
+                raise ValueError("set agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("set agents cannot have 'timeout'")
             if self.workflow:
@@ -2339,6 +2394,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("terminate agents cannot have 'working_dir'")
+            if self.settings_dir:
+                raise ValueError("terminate agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("terminate agents cannot have 'timeout'")
             if self.timeout_seconds is not None:
@@ -2676,11 +2733,19 @@ class ProviderSettings(BaseModel):
     installed, so a run reproduces on another developer's laptop.
 
     Set it to opt a workflow back in. The motivating case is an agent working
-    inside a *target* repository that ships its own ``.claude/skills`` — with
-    ``working_dir`` pointed at that repo, ``["project"]`` loads that repo's
-    skills and instructions natively, without the repo needing to package
-    them as a Claude Code plugin (the CLI has ``--plugin-dir`` but no
-    ``--skill-dir``, so a plugin root is otherwise the only handle).
+    against a *target* repository that ships its own ``.claude/skills``:
+    ``["project"]`` loads that repository's skills natively, without it
+    needing to package them as a Claude Code plugin (the CLI has
+    ``--plugin-dir`` but no ``--skill-dir``, so a plugin root is otherwise
+    the only handle).
+
+    Which directory the ``project`` tier reads is chosen per agent. Skills
+    come from cwd (:attr:`AgentDef.working_dir`) *and* from
+    :attr:`AgentDef.settings_dir`; everything else the tier defines --
+    ``CLAUDE.md``, ``.claude/settings.json``, ``.claude/agents`` — follows
+    cwd alone. Prefer ``settings_dir`` when the agent also needs a wider cwd:
+    the CLI advertises cwd as its sole MCP root, so narrowing cwd onto the
+    target repository narrows what the agent's MCP servers may read.
 
     Each tier brings everything that tier defines, hooks included: ``project``
     reads ``<cwd>/.claude/settings.json``, whose ``hooks`` entries run

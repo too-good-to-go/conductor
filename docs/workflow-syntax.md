@@ -400,6 +400,80 @@ Because paths are normalized lexically instead of resolving to their real paths:
 > Setting `working_dir` doesn't restrict the model's filesystem access. The model can still read and write files outside this directory if it uses absolute paths or parent directory traversals (e.g., `../`). Avoid relying on this configuration to sandbox untrusted model execution.
 > On the `claude-agent-sdk` provider the directory is also a trust boundary in the other direction: the `claude` CLI loads `CLAUDE.md` and `.claude/settings*.json` (including hooks) from wherever it runs, so pointing `working_dir` at an untrusted checkout means running that checkout's instructions.
 
+### Target-Repository Skills (`settings_dir`)
+
+`settings_dir` names a second directory whose Claude Code *project* settings
+tier the agent reads skills from. It applies to `claude-agent-sdk` agents in a
+workflow that sets `runtime.provider.setting_sources`, and is ignored by every
+other provider.
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      setting_sources: [project]
+
+agents:
+  - name: judge
+    settings_dir: "{{ setup_worktree.output.worktree_path }}"
+    prompt: Review the change against this repository's conventions.
+```
+
+#### Why it is separate from `working_dir`
+
+An agent's cwd does two unrelated jobs, and on this provider they conflict.
+The `claude` CLI supports the MCP Roots protocol and advertises exactly one
+root — its cwd. A filesystem MCP server therefore **discards the directories
+in its own argv** and permits cwd alone; `--add-dir` takes no part in that
+negotiation, so it cannot widen what a server allows. cwd is simultaneously
+the directory the `project` settings tier resolves against.
+
+So pointing `working_dir` at a target repository to pick up that repository's
+skills also narrows the agent's only MCP root onto it, and any sibling path
+the step still has to read — an artifacts directory, a second checkout — is
+denied. Widening cwd back loses the repository's conventions.
+
+`settings_dir` splits the two. Skills are discovered from cwd **and** from
+`settings_dir`, so cwd can stay wide enough to contain everything the agent
+must read:
+
+```yaml
+agents:
+  - name: judge
+    # No working_dir: cwd stays the launch directory, which contains both the
+    # worktree and the artifacts this judge reads through the filesystem MCP.
+    settings_dir: "{{ setup_worktree.output.worktree_path }}"
+```
+
+#### What it does and does not carry
+
+A directory named here contributes its `.claude/skills` and nothing else.
+`CLAUDE.md`, `.claude/settings.json` (so `env` and `hooks`) and
+`.claude/agents` all continue to follow cwd. Instructions therefore still need
+`working_dir` or `--workspace-instructions`; this field is the skills half
+only.
+
+That asymmetry is a measured property of the CLI, not a design choice
+Conductor makes, and it cuts favourably: enabling a tier for a target
+repository brings that repository's skills without also running its hooks.
+
+#### Resolution and restrictions
+
+- Resolved exactly like `working_dir` — Jinja2-rendered, `~`-expanded,
+  relative paths resolved against the workflow file's directory, normalized
+  with `os.path.normpath`, and existence-checked before any provider call.
+- Per-agent only. There is no `runtime.settings_dir`, because the repository
+  whose conventions apply is what varies between steps.
+- Rejected on `wait`, `set`, `terminate`, `script`, `human_gate`, `questions`
+  and `workflow` step types — none has an LLM session to apply a settings tier
+  to, and accepting it silently would suggest conventions had been loaded when
+  none had.
+
+> ⚠️ A settings tier brings everything that tier defines. Enable
+> `setting_sources` and point `settings_dir` only at repositories trusted to
+> the same degree as the workflow itself.
+
 ### Session Continuity (`session_key`)
 
 By default each agent execution starts a fresh provider session, so an agent

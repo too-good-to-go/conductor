@@ -610,28 +610,23 @@ class WorkflowEngine:
         """Resolved parent directory of the workflow file, or None if unset."""
         return Path(self.workflow_path).resolve().parent if self.workflow_path else None
 
-    def _resolve_agent_working_dir(
-        self, agent: AgentDef, agent_context: dict[str, Any]
-    ) -> AgentDef:
-        """Resolve an agent's effective ``working_dir`` and return an updated copy.
+    def _resolve_agent_directory(
+        self, agent: AgentDef, agent_context: dict[str, Any], field: str, raw: str
+    ) -> str:
+        """Render and absolutize one authored directory value.
 
-        Precedence is ``agent.working_dir`` over ``runtime.working_dir``; the
-        chosen raw value is Jinja-rendered against the per-agent context (so
-        both levels support templates, e.g. ``{{ item }}`` in for-each), then
-        ``~``-expanded, made absolute against the workflow file's directory
-        (falling back to the process cwd), and lexically normalised with
-        :func:`os.path.normpath` (``resolve()`` is deliberately not used so
-        symlink aliases stay distinct). A missing directory raises
-        :class:`ExecutionError` before any provider call. When neither level
-        sets a value the agent is returned unchanged (``working_dir=None`` and
-        the provider uses its own cwd).
+        Shared by ``working_dir`` and ``settings_dir`` so the two cannot drift
+        apart: the raw value is Jinja-rendered against the per-agent context
+        (so templates such as ``{{ item }}`` in for-each work at either
+        level), then ``~``-expanded, made absolute against the workflow
+        file's directory (falling back to the process cwd), and lexically
+        normalised with :func:`os.path.normpath` (``resolve()`` is
+        deliberately not used so symlink aliases stay distinct).
+
+        Raises:
+            ExecutionError: if the resolved path is not an existing directory
+                — before any provider call.
         """
-        raw = agent.working_dir
-        if raw is None:
-            raw = self.config.workflow.runtime.working_dir
-        if raw is None:
-            return agent
-
         rendered = self.renderer.render(raw, agent_context)
         path = Path(rendered).expanduser()
         if not path.is_absolute():
@@ -641,16 +636,52 @@ class WorkflowEngine:
 
         if not Path(resolved).is_dir():
             raise ExecutionError(
-                f"Agent '{agent.name}': working_dir '{resolved}' does not exist or "
+                f"Agent '{agent.name}': {field} '{resolved}' does not exist or "
                 f"is not a directory (rendered from '{raw}')",
                 agent_name=agent.name,
                 suggestion=(
                     "Create the directory before the agent runs (e.g. via a "
-                    "script step) or fix the working_dir template."
+                    f"script step) or fix the {field} template."
                 ),
             )
+        return resolved
 
-        return agent.model_copy(update={"working_dir": resolved})
+    def _resolve_agent_working_dir(
+        self, agent: AgentDef, agent_context: dict[str, Any]
+    ) -> AgentDef:
+        """Resolve an agent's ``working_dir`` and ``settings_dir``, returning a copy.
+
+        ``working_dir`` precedence is ``agent.working_dir`` over
+        ``runtime.working_dir``; ``settings_dir`` is per-agent only, since the
+        directory whose conventions apply is what varies between steps. Both
+        are resolved by :meth:`_resolve_agent_directory`. An agent setting
+        neither is returned unchanged, leaving the provider its own cwd.
+
+        The two are independent on purpose: ``working_dir`` becomes the
+        session cwd, which the CLI advertises as its sole MCP root, while
+        ``settings_dir`` only adds a directory whose project-tier skills are
+        discoverable. An agent can therefore keep a wide cwd — wide enough
+        for every path its MCP servers must reach — and still load a
+        narrower target repository's skills.
+        """
+        update: dict[str, Any] = {}
+
+        raw = agent.working_dir
+        if raw is None:
+            raw = self.config.workflow.runtime.working_dir
+        if raw is not None:
+            update["working_dir"] = self._resolve_agent_directory(
+                agent, agent_context, "working_dir", raw
+            )
+
+        if agent.settings_dir is not None:
+            update["settings_dir"] = self._resolve_agent_directory(
+                agent, agent_context, "settings_dir", agent.settings_dir
+            )
+
+        if not update:
+            return agent
+        return agent.model_copy(update=update)
 
     def _build_pricing_overrides(self) -> dict[str, ModelPricing] | None:
         """Build pricing overrides from workflow cost configuration.
