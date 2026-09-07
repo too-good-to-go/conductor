@@ -302,23 +302,6 @@ def _server_tool_filters(mcp_servers: dict[str, Any]) -> dict[str, set[str]]:
     }
 
 
-def _stdio_path_args(mcp_servers: dict[str, Any]) -> list[str]:
-    """Absolute directory args of stdio MCP servers, for ``add_dirs``.
-
-    The CLI's MCP Roots override a server's own path args with cwd +
-    ``--add-dir``, so a server declared with two directories is rooted at one
-    and the rest denied. Forwarding these restores the declared scope.
-    """
-    paths: list[str] = []
-    for config in mcp_servers.values():
-        if config.get("type") != "stdio":
-            continue
-        for arg in config.get("args") or []:
-            if isinstance(arg, str) and arg.startswith("/") and Path(arg).is_dir():
-                paths.append(arg)
-    return sorted(set(paths))
-
-
 def _resolve_skill_filter(skill_names: list[str], setting_sources: list[str]) -> list[str] | str:
     """Value for ``ClaudeAgentOptions.skills`` — the name-level skill filter.
 
@@ -692,6 +675,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # rather than being stamped individually as they are for Copilot:
         # the SDK's ``McpStdioServerConfig`` has no cwd field.
         working_dir=True,
+        # ``settings_dir`` reaches ``ClaudeAgentOptions.add_dirs``, the CLI's
+        # ``--add-dir``. It is the only provider that has anywhere to put it.
+        settings_dir=True,
         # Skills are loaded natively: the owning plugin is registered via
         # ``ClaudeAgentOptions.plugins`` and enabled by its qualified name
         # through ``skills``, so the model reads the frontmatter up front
@@ -975,9 +961,6 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
             server_denied = _server_filter_denials(enumerated_mcp_tools, self._server_tool_filters)
 
-        # Restores the MCP scope the CLI's Roots would otherwise collapse to cwd.
-        add_dirs = _stdio_path_args({**self._mcp_servers, **(extra_mcp_servers or {})})
-
         sdk_tools, permission_mode, allowed_tools, disallowed_tools = self._resolve_tool_config(
             tools,
             agent,
@@ -1012,8 +995,28 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so pass it through verbatim rather than re-resolving — that would
             # collapse the symlink aliases the engine preserves.
             cwd=resolved_cwd,
-            # MCP Roots collapse a server's own path args to cwd without these.
-            add_dirs=add_dirs,
+            # The authored ``settings_dir`` and nothing else. An earlier
+            # version derived this from the directory args of every stdio MCP
+            # server, believing it restored a scope those args had lost. It
+            # cannot: a filesystem MCP server uses its argv directories only
+            # when the client does not support MCP Roots, and the CLI does
+            # support Roots — advertising exactly one, its cwd — so the argv
+            # directories are discarded by the server itself. ``--add-dir`` is
+            # not part of Roots negotiation and so cannot put them back; it
+            # widens the CLI's own file tools, never what a server permits.
+            # Measured: cwd alone is the effective allowlist whether or not
+            # every declared root is also passed here.
+            #
+            # What it does do is make a directory's *project* settings tier
+            # discoverable — its ``.claude/skills`` become listed and
+            # invocable with cwd elsewhere entirely (and only those: not
+            # CLAUDE.md, .claude/rules/*.md, .claude/settings.json or
+            # .claude/agents, which all stay with cwd -- measured, so this is
+            # the skills portion of a project tier rather than a
+            # cwd-independent way to load one). That is its one job, so the value
+            # is the author's ``settings_dir`` rather than a guess derived
+            # from server arguments.
+            add_dirs=[agent.settings_dir] if agent.settings_dir else [],
             output_format=_build_output_format(agent.output) if agent.output else None,
             max_turns=max_turns,
             permission_mode=permission_mode,
