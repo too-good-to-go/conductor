@@ -456,7 +456,8 @@ Measured against the CLI:
 | `.claude/skills` | **yes** — listed and invocable |
 | `CLAUDE.md` | no |
 | `.claude/rules/*.md` | no |
-| `.claude/settings.json` (`env`, `hooks`) | no |
+| `.claude/settings.json` `env` | no |
+| `.claude/settings.json` `hooks` | **not established** — see below |
 | `.claude/agents` | no |
 
 > ⚠️ **The filesystem grant does not depend on `setting_sources`.** This field
@@ -474,6 +475,14 @@ Measured against the CLI:
 Note this grant is for the model's **built-in** tools only. It does not widen
 what a filesystem MCP server permits — that stays cwd alone, which is the
 whole reason this field exists.
+
+**The `hooks` row is honestly unknown, not a measured negative.** The probe
+behind it grepped the CLI's debug output for a hook's marker and found nothing
+-- but it also found nothing in the control, where cwd *was* the directory and
+the hook demonstrably should have run. A probe that returns nothing in its own
+baseline cannot support a negative, so treat hooks as undetermined: do not
+rely on them running, and do not rely on them being suppressed. Establishing
+it needs a hook with an observable side effect, such as writing a file.
 
 Setting aside the filesystem grant, this field is the *skills portion* of a
 project tier, not a cwd-independent way to load one. It cuts favourably in one direction —
