@@ -449,14 +449,26 @@ agents:
 #### What it does and does not carry
 
 A directory named here contributes its `.claude/skills` and nothing else.
-`CLAUDE.md`, `.claude/settings.json` (so `env` and `hooks`) and
-`.claude/agents` all continue to follow cwd. Instructions therefore still need
-`working_dir` or `--workspace-instructions`; this field is the skills half
-only.
+Measured against the CLI, all of the following continue to follow cwd:
 
-That asymmetry is a measured property of the CLI, not a design choice
-Conductor makes, and it cuts favourably: enabling a tier for a target
-repository brings that repository's skills without also running its hooks.
+| Named via `settings_dir` | Loaded? |
+|---|---|
+| `.claude/skills` | **yes** — listed and invocable |
+| `CLAUDE.md` | no |
+| `.claude/rules/*.md` | no |
+| `.claude/settings.json` (`env`, `hooks`) | no |
+| `.claude/agents` | no |
+
+So this field is the *skills portion* of a project tier, not a
+cwd-independent way to load one. It cuts favourably in one direction —
+a target repository's skills arrive without its hooks also running — but it
+does not compose with `working_dir` into "everything, anywhere":
+
+> An agent that needs a target repository's **rules or instructions** as well
+> as a cwd wide enough for its MCP servers cannot get both from these fields.
+> One directory cannot be narrow and wide at once. `settings_dir` recovers the
+> skills; anything else is a caller-side trade — keep `working_dir` on the
+> repository and arrange for every path the agent reads to sit beneath it.
 
 #### Resolution and restrictions
 

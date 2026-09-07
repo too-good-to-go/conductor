@@ -3375,6 +3375,47 @@ class TestSettingsDirAddDirs:
         assert captured["add_dirs"] == [str(narrow)]
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_settings_dir_does_not_become_a_second_cwd(self, tmp_path: Path) -> None:
+        """The boundary of what this field can deliver, pinned deliberately.
+
+        ``add_dirs`` carries a directory's ``.claude/skills`` and nothing
+        else: ``CLAUDE.md``, ``.claude/rules/*.md``, ``.claude/settings.json``
+        (so ``env`` and ``hooks``) and ``.claude/agents`` all follow cwd
+        instead -- measured against the CLI, not inferred. So a
+        ``settings_dir`` must never be quietly promoted into ``cwd`` in an
+        attempt to widen what it loads: that would hand the agent the narrow
+        directory as its sole MCP root, which is the exact defect this field
+        exists to avoid.
+
+        An agent needing a repository's rules *and* a wide cwd cannot have
+        both from these two fields, and this test is what keeps that trade
+        visible rather than papered over.
+        """
+        wide = tmp_path / "wide"
+        wide.mkdir()
+        narrow = wide / "repo"
+        narrow.mkdir()
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["cwd"] = kwargs["options"].cwd
+            captured["add_dirs"] = kwargs["options"].add_dirs
+            yield _result(result="ok")
+
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider()
+            await provider.execute(
+                agent=AgentDef(
+                    name="t", prompt="hi", working_dir=str(wide), settings_dir=str(narrow)
+                ),
+                context={},
+                rendered_prompt="hi",
+            )
+
+        assert captured["cwd"] == str(wide)
+        assert str(narrow) not in (captured["cwd"] or "")
+
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_settings_dir_passed_verbatim(self, tmp_path: Path) -> None:
         """Not re-resolved, matching ``cwd``: the engine already rendered,
         absolutized and existence-checked it, and ``resolve()`` here would

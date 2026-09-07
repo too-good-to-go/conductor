@@ -1007,8 +1007,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # What it does do is make a directory's *project* settings tier
             # discoverable — its ``.claude/skills`` become listed and
             # invocable with cwd elsewhere entirely (and only those: not
-            # CLAUDE.md, .claude/settings.json or .claude/agents, which stay
-            # with cwd). That is the one job it is used for here, so the value
+            # CLAUDE.md, .claude/rules/*.md, .claude/settings.json or
+            # .claude/agents, which all stay with cwd -- measured, so this is
+            # the skills portion of a project tier rather than a
+            # cwd-independent way to load one). That is its one job, so the value
             # is the author's ``settings_dir`` rather than a guess derived
             # from server arguments.
             add_dirs=[agent.settings_dir] if agent.settings_dir else [],

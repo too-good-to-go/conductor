@@ -1386,10 +1386,17 @@ class AgentDef(BaseModel):
 
     The split is not total, and the remainder is deliberate. A directory
     named here contributes its ``.claude/skills`` and nothing else — not
-    ``CLAUDE.md``, not ``.claude/settings.json`` (so no ``env`` and no
-    ``hooks``), not ``.claude/agents``, all of which continue to follow cwd.
-    Instructions therefore still need ``working_dir`` (or
-    ``--workspace-instructions``); this field is the skills half only.
+    ``CLAUDE.md``, not ``.claude/rules/*.md``, not ``.claude/settings.json``
+    (so no ``env`` and no ``hooks``), not ``.claude/agents``, all of which
+    continue to follow cwd. This field is the *skills* portion of a project
+    tier, not a cwd-independent way to load one: instructions, rules and
+    hooks still require ``working_dir`` pointed at the directory.
+
+    So the two fields do not compose into "everything, anywhere". An agent
+    needing a target repository's rules *and* a cwd wide enough for its MCP
+    servers cannot have both from these fields alone -- one directory cannot
+    be simultaneously narrow and wide. ``settings_dir`` recovers the skills;
+    the rest is a caller-side trade.
 
     Example — a judge reviewing a target repository while reading artifacts
     from a sibling directory::
