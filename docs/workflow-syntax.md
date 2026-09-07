@@ -448,19 +448,35 @@ agents:
 
 #### What it does and does not carry
 
-A directory named here contributes its `.claude/skills` and nothing else.
-Measured against the CLI, all of the following continue to follow cwd:
+Measured against the CLI:
 
-| Named via `settings_dir` | Loaded? |
+| Named via `settings_dir` | Granted? |
 |---|---|
+| **Filesystem access for the model's built-in tools** (`Read`, `Edit`, `Bash`, …) | **yes — unconditionally**, see below |
 | `.claude/skills` | **yes** — listed and invocable |
 | `CLAUDE.md` | no |
 | `.claude/rules/*.md` | no |
 | `.claude/settings.json` (`env`, `hooks`) | no |
 | `.claude/agents` | no |
 
-So this field is the *skills portion* of a project tier, not a
-cwd-independent way to load one. It cuts favourably in one direction —
+> ⚠️ **The filesystem grant does not depend on `setting_sources`.** This field
+> maps to the SDK's `add_dirs`, whose own contract is *"additional directories
+> Claude can access beyond the current working directory"* — so naming a
+> directory here widens the model's built-in file tools to that tree whether or
+> not any settings tier is enabled. Measured with `setting_sources` unset and
+> `permission_mode: default`: without `settings_dir` a read outside cwd is
+> refused for permissions; with it, the same read succeeds.
+>
+> Skill discovery is the *reason* to set this field; the filesystem grant is
+> its unavoidable companion. Point it at a directory the agent is entitled to
+> read.
+
+Note this grant is for the model's **built-in** tools only. It does not widen
+what a filesystem MCP server permits — that stays cwd alone, which is the
+whole reason this field exists.
+
+Setting aside the filesystem grant, this field is the *skills portion* of a
+project tier, not a cwd-independent way to load one. It cuts favourably in one direction —
 a target repository's skills arrive without its hooks also running — but it
 does not compose with `working_dir` into "everything, anywhere":
 

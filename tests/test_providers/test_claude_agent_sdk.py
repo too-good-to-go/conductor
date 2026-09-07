@@ -3412,8 +3412,12 @@ class TestSettingsDirAddDirs:
                 rendered_prompt="hi",
             )
 
+        # The line that pins it: cwd is the wide directory exactly. The
+        # earlier `narrow not in cwd` substring check added nothing -- it also
+        # passes for an implementation that sets cwd to an unrelated third
+        # directory, so it read as a guard without being one.
         assert captured["cwd"] == str(wide)
-        assert str(narrow) not in (captured["cwd"] or "")
+        assert captured["add_dirs"] == [str(narrow)]
 
     @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
     async def test_settings_dir_passed_verbatim(self, tmp_path: Path) -> None:

@@ -675,6 +675,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # rather than being stamped individually as they are for Copilot:
         # the SDK's ``McpStdioServerConfig`` has no cwd field.
         working_dir=True,
+        # ``settings_dir`` reaches ``ClaudeAgentOptions.add_dirs``, the CLI's
+        # ``--add-dir``. It is the only provider that has anywhere to put it.
+        settings_dir=True,
         # Skills are loaded natively: the owning plugin is registered via
         # ``ClaudeAgentOptions.plugins`` and enabled by its qualified name
         # through ``skills``, so the model reads the frontmatter up front

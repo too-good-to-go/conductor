@@ -14,10 +14,23 @@ to, would reintroduce the confusion the split removes.
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
-from conductor.config.schema import AgentDef, GateOption
+from conductor.config.schema import (
+    AgentDef,
+    GateOption,
+    OutputField,
+    ProviderSettings,
+    RouteDef,
+    RuntimeConfig,
+    WorkflowConfig,
+    WorkflowDef,
+)
+from conductor.config.validator import validate_workflow_config
+from conductor.exceptions import ConfigurationError
 
 
 class TestSettingsDirAccepted:
@@ -85,3 +98,86 @@ class TestSettingsDirRejectedOnNonProviderSteps:
         """So the message says which step to fix, not merely that one is wrong."""
         with pytest.raises(ValidationError, match="wait agents cannot have 'settings_dir'"):
             AgentDef(name="bad", type="wait", duration="1s", settings_dir="/repo")
+
+
+class TestSettingsDirValidation:
+    """``conductor validate`` must not report success on a silent no-op.
+
+    Every case here was green before these checks existed, which is the point:
+    the step-type rejections above guard authoring mistakes nobody makes, while
+    the three below are the ones an author actually makes -- wrong provider,
+    forgotten `setting_sources`, typo'd upstream step name. A green validate
+    for any of them tells the author their target repository's conventions
+    loaded when nothing did.
+    """
+
+    @staticmethod
+    def _config(provider: object, settings_dir: str, tmp_path: Path) -> WorkflowConfig:
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="w",
+                entry_point="a",
+                runtime=RuntimeConfig(provider=provider),  # type: ignore[arg-type]
+            ),
+            agents=[
+                AgentDef(
+                    name="a",
+                    prompt="hi",
+                    settings_dir=settings_dir,
+                    output={"r": OutputField(type="string")},
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+            output={"r": "{{ a.output.r }}"},
+        )
+
+    def test_rejected_on_a_provider_that_cannot_apply_it(self, tmp_path: Path) -> None:
+        """Only ``claude-agent-sdk`` has an ``add_dirs`` to put it in.
+
+        Same class as ``working_dir``, whose capability docstring gives the
+        reason: silently ignoring the directory runs the agent against the
+        wrong repository while reporting success.
+        """
+        config = self._config("copilot", str(tmp_path), tmp_path)
+
+        with pytest.raises(ConfigurationError, match="does not apply it"):
+            validate_workflow_config(config)
+
+    def test_accepted_on_claude_agent_sdk_with_setting_sources(self, tmp_path: Path) -> None:
+        """The supported combination raises nothing."""
+        config = self._config(
+            ProviderSettings(name="claude-agent-sdk", setting_sources=["project"]),
+            str(tmp_path),
+            tmp_path,
+        )
+
+        validate_workflow_config(config)  # no raise
+
+    def test_warns_when_no_settings_tier_is_enabled(self, tmp_path: Path) -> None:
+        """A warning, not an error, and the distinction is load-bearing.
+
+        Without ``setting_sources`` no ``project`` tier exists, so the skills
+        half -- the reason the field is normally set -- is a no-op. The
+        filesystem half still applies, so the workflow is not broken; erroring
+        would refuse a configuration that does something.
+        """
+        config = self._config("claude-agent-sdk", str(tmp_path), tmp_path)
+
+        warnings = validate_workflow_config(config)
+
+        assert any("setting_sources" in w for w in warnings), warnings
+        assert any("no skills will be discovered" in w for w in warnings), warnings
+
+    def test_template_referencing_an_unknown_step_is_caught(self, tmp_path: Path) -> None:
+        """The field is normally templated from an upstream step, so a typo'd
+        step name is the likely authoring error. It must fail at validate, as
+        the same typo in ``working_dir`` already does, rather than at run
+        time."""
+        config = self._config(
+            ProviderSettings(name="claude-agent-sdk", setting_sources=["project"]),
+            "{{ nonexistent_step.output.path }}",
+            tmp_path,
+        )
+
+        with pytest.raises(ConfigurationError, match="nonexistent_step"):
+            validate_workflow_config(config)

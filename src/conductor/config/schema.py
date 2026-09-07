@@ -1361,14 +1361,24 @@ class AgentDef(BaseModel):
     settings_dir: str | None = None
     """Directory whose Claude Code *project* settings tier this agent loads.
 
-    Only meaningful on ``claude-agent-sdk`` agents in a workflow that sets
-    ``runtime.provider.setting_sources`` (see
-    :attr:`ProviderSettings.setting_sources`); ignored by every other
-    provider. Resolved by the engine exactly like :attr:`working_dir`
-    (Jinja-rendered, ``~``-expanded, made absolute against the workflow
-    file's directory, ``normpath``-normalised, existence-checked), then
-    forwarded to the SDK as ``ClaudeAgentOptions.add_dirs``. Rejected on
-    wait/set/terminate/human_gate/questions/workflow step types.
+    ``claude-agent-sdk`` only -- ``conductor validate`` refuses it against a
+    provider that cannot apply it, rather than dropping it silently. Resolved
+    by the engine exactly like :attr:`working_dir` (Jinja-rendered,
+    ``~``-expanded, made absolute against the workflow file's directory,
+    ``normpath``-normalised, existence-checked), then forwarded to the SDK as
+    ``ClaudeAgentOptions.add_dirs``. Rejected on
+    wait/set/terminate/script/human_gate/questions/workflow step types.
+
+    **Two effects, and only one of them is conditional.** Skill discovery
+    requires ``runtime.provider.setting_sources`` to enable the ``project``
+    tier; ``conductor validate`` warns when this field is set without it,
+    since the skills half is then a no-op. The *filesystem* grant is
+    unconditional: ``add_dirs``' own SDK contract is "additional directories
+    Claude can access beyond the current working directory", so naming a
+    directory here widens the model's built-in ``Read``/``Edit``/``Bash``
+    tools to that tree regardless of any settings tier. It does **not** widen
+    what a filesystem MCP server permits -- that stays cwd alone, which is why
+    this field exists. Point it only at a directory the agent may read.
 
     It exists because ``working_dir`` was doing two unrelated jobs. The CLI
     supports MCP Roots and advertises exactly one root — its cwd — so a

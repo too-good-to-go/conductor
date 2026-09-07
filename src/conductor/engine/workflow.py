@@ -651,6 +651,11 @@ class WorkflowEngine:
     ) -> AgentDef:
         """Resolve an agent's ``working_dir`` and ``settings_dir``, returning a copy.
 
+        The name says ``working_dir`` only for historical reasons -- it is
+        referenced by name from four other modules' comments, so renaming it
+        costs more than it explains. Grep for ``settings_dir`` and this is
+        where it is resolved.
+
         ``working_dir`` precedence is ``agent.working_dir`` over
         ``runtime.working_dir``; ``settings_dir`` is per-agent only, since the
         directory whose conventions apply is what varies between steps. Both
@@ -4483,7 +4488,7 @@ class WorkflowEngine:
                             agent_type=agent.type,
                         )
 
-                        # Resolve working_dir only for provider-backed LLM agents
+                        # Resolve working_dir / settings_dir for provider-backed LLM agents
                         # (type None/"agent"). wait/set/terminate/human_gate/
                         # workflow are schema-rejected from declaring one, and
                         # script resolves its own in ScriptExecutor.
@@ -6292,7 +6297,7 @@ class WorkflowEngine:
                     )
                     return (agent.name, set_output.value)
 
-                # Resolve working_dir for provider-backed LLM agents against
+                # Resolve working_dir / settings_dir for provider-backed LLM agents against
                 # this agent's own (pre-group snapshot) context. `set` steps
                 # returned above; other types in a parallel group are LLM agents.
                 resolved_agent = self._resolve_agent_working_dir(agent, agent_context)
@@ -6778,7 +6783,7 @@ class WorkflowEngine:
                     update={"name": f"{for_each_group.agent.name}[{key}]"}
                 )
 
-                # Resolve working_dir AFTER loop variables were injected into
+                # Resolve working_dir / settings_dir AFTER loop variables were injected into
                 # agent_context so a `{{ item }}` (or `{{ <as_> }}`) template in
                 # the path resolves to this iteration's value.
                 qualified_agent = self._resolve_agent_working_dir(qualified_agent, agent_context)
