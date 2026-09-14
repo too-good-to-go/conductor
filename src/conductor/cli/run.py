@@ -230,6 +230,8 @@ def _describe_provider(provider: ProviderSettings) -> str:
         parts.append(f"runtime_url={provider.runtime_url}")
     if provider.runtime_token is not None:
         parts.append("runtime_token=***")
+    if provider.setting_sources is not None:
+        parts.append(f"setting_sources={provider.setting_sources}")
     return " ".join(parts)
 
 
@@ -1051,6 +1053,34 @@ class ConsoleEventSubscriber:
                 style="red",
             )
 
+        elif t == "mcp_completed":
+            # Mirror of the wait_completed branch: one line naming the step's
+            # server/tool and elapsed. `mcp_started` is deliberately not
+            # printed — started events never reach the console.
+            verbose_log(
+                styled(
+                    "  MCP call done: {} {} after {:.2f}s",
+                    d.get("server", "?"),
+                    d.get("tool", "?"),
+                    d.get("elapsed", 0.0),
+                )
+            )
+
+        elif t == "mcp_failed":
+            # Unlike script_failed (which has no branch), an mcp failure must
+            # be visible here: a connect failure is otherwise silent until the
+            # run terminates with workflow_failed.
+            verbose_log(
+                styled(
+                    "  MCP call failed: {} {} — {}: {}",
+                    d.get("server", "?"),
+                    d.get("tool", "?"),
+                    d.get("error_type", "Error"),
+                    d.get("message", "unknown"),
+                ),
+                style="red",
+            )
+
         elif t == "agent_validator_start":
             verbose_log(f"  Validating '{_validator_label(d)}' output…", style="cyan")
 
@@ -1083,6 +1113,8 @@ class ConsoleEventSubscriber:
             )
             for issue in issues:
                 verbose_log(f"    - {issue}", style="dim")
+            if d.get("rerun_errored") and d.get("error"):
+                verbose_log(f"    cause: {d.get('error')}", style=style)
 
         elif t == "skill_injection_warning":
             # Only reaches the console through this branch: the executor's
@@ -1164,6 +1196,131 @@ class ConsoleEventSubscriber:
             verbose_log(
                 f"  WARNING: retrying '{agent_name}' output ({kind}) "
                 f"— attempt {attempt}/{max_attempts}{detail}",
+                style="yellow",
+            )
+
+        elif t == "agent_compaction_config":
+            agent_name = d.get("agent_name", "?")
+            context_window = d.get("context_window", 0)
+            output_limit = d.get("output_limit", 0)
+            if not d.get("enabled", True):
+                verbose_log(
+                    styled(
+                        "  WARNING: compaction disabled for '[bold]{}[/bold]' ({}) — "
+                        "lower runtime.max_tokens or tool_output.max_chars",
+                        agent_name,
+                        d.get("disabled_reason") or "unknown",
+                    ),
+                    style="yellow",
+                )
+            else:
+                trigger_tokens = d.get("trigger_tokens", 0)
+                target_tokens = d.get("target_tokens", 0)
+                verbose_log(
+                    styled(
+                        "  NOTE: compaction armed for '[bold]{}[/bold]' "
+                        "(window {} from {}, output limit {} from {}, trigger {}, target {})",
+                        agent_name,
+                        context_window,
+                        d.get("context_window_source", "?"),
+                        output_limit,
+                        d.get("output_limit_source", "?"),
+                        trigger_tokens,
+                        target_tokens,
+                    ),
+                    style="dim",
+                )
+
+        elif t == "agent_compaction_start":
+            agent_name = d.get("agent_name", "?")
+            tokens_before = d.get("tokens_before", 0)
+            context_window = d.get("context_window", 0) or 0
+            context_window_source = d.get("context_window_source", "?")
+            pct = int(tokens_before / context_window * 100) if context_window > 0 else 0
+            verbose_log(
+                styled(
+                    "  NOTE: compacting context for '[bold]{}[/bold]' "
+                    "({} tokens, {}% of {} window from {})",
+                    agent_name,
+                    tokens_before,
+                    pct,
+                    context_window,
+                    context_window_source,
+                ),
+                style="dim blue",
+            )
+
+        elif t == "agent_compaction_complete":
+            agent_name = d.get("agent_name", "?")
+            if d.get("errored"):
+                error_type = d.get("error_type", "Error")
+                message = d.get("message", "unknown")
+                verbose_log(
+                    styled(
+                        "  WARNING: context compaction failed for '[bold]{}[/bold]' "
+                        "({}: {}) — compaction is disabled for the remainder of this run",
+                        agent_name,
+                        error_type,
+                        message,
+                    ),
+                    style="yellow",
+                )
+            else:
+                tokens_before = d.get("tokens_before", 0)
+                tokens_after = d.get("tokens_after", 0)
+                messages_before = d.get("messages_before", 0)
+                messages_after = d.get("messages_after", 0)
+                elapsed = d.get("elapsed", 0.0)
+                degraded_tiers = d.get("degraded_tiers") or []
+                degraded_estimators = d.get("degraded_estimators") or []
+                still_over_trigger = d.get("still_over_trigger", False)
+                still_over_window = d.get("still_over_window", False)
+                if degraded_tiers or degraded_estimators or still_over_trigger or still_over_window:
+                    reasons: list[str] = []
+                    if degraded_tiers:
+                        reasons.append(f"tier(s) degraded: {', '.join(degraded_tiers)}")
+                    if degraded_estimators:
+                        reasons.append(f"estimator(s) degraded: {', '.join(degraded_estimators)}")
+                    if still_over_trigger:
+                        reasons.append("history remains above the trigger")
+                    if still_over_window:
+                        reasons.append("history remains above the known context window")
+                    verbose_log(
+                        styled(
+                            "  WARNING: context compacted for '[bold]{}[/bold]': "
+                            "{} → {} tokens ({} → {} messages, {:.2f}s) — {}",
+                            agent_name,
+                            tokens_before,
+                            tokens_after,
+                            messages_before,
+                            messages_after,
+                            elapsed,
+                            "; ".join(reasons),
+                        ),
+                        style="yellow",
+                    )
+                else:
+                    verbose_log(
+                        styled(
+                            "  NOTE: context compacted for '[bold]{}[/bold]': "
+                            "{} → {} tokens ({} → {} messages, {:.2f}s)",
+                            agent_name,
+                            tokens_before,
+                            tokens_after,
+                            messages_before,
+                            messages_after,
+                            elapsed,
+                        )
+                    )
+
+        elif t == "agent_compaction_skipped":
+            verbose_log(
+                styled(
+                    "  WARNING: compaction skipped for '[bold]{}[/bold]' ({}) — "
+                    "context size could not be measured for this request",
+                    d.get("agent_name", "?"),
+                    d.get("reason", "unknown"),
+                ),
                 style="yellow",
             )
 
@@ -1913,6 +2070,101 @@ def _remove_run_record_for_current_process_safe() -> None:
         logger.warning("Failed to remove fleet run record", exc_info=True)
 
 
+def _write_terminal_record_for_current_process(
+    *,
+    event_log_subscriber: Any,
+    workflow_path: Path | None,
+    started_at: str,
+    status: str,
+    output: dict[str, Any],
+    error_type: str | None,
+    error_message: str | None,
+    engine: WorkflowEngine | None,
+) -> None:
+    """Write this run's Fleet Manager *terminal* run record (MCP server plan E2).
+
+    Called from the ``finally`` block of both ``run_workflow_async`` and
+    ``resume_workflow_async``, immediately before
+    :func:`_remove_run_record_for_current_process_safe` removes the *live*
+    record — so a completed run remains resolvable by ``run_id`` after this
+    process exits (the design's "one genuinely new artifact"). A resumed
+    run reuses its predecessor's ``run_id``, so this replaces the earlier
+    terminal record rather than creating a second one, exactly as
+    ``write_run_record`` already does for the live record.
+
+    No-op when ``event_log_subscriber`` is ``None``: without one, no
+    ``run_id`` was ever established for this process (e.g. a failure
+    before the JSONL subscriber was even constructed), so there is no live
+    record for this to replace and nothing to key a terminal record by.
+    ``workflow_path`` is likewise permitted to be ``None`` (``resume``'s
+    ``resolved_workflow_path`` is not assigned until after checkpoint
+    resolution succeeds) but is only ever dereferenced once
+    ``event_log_subscriber`` has already been confirmed non-``None``, since
+    the JSONL subscriber is always constructed after the workflow path is
+    resolved on every call path.
+
+    Token/cost totals are read from ``engine.get_execution_summary()``
+    *unconditionally* — not gated on ``config.workflow.cost.show_summary``
+    the way the console usage-summary display is — because a terminal
+    record that silently omits cost for every run where that display
+    happens to be off is worse than one that omits cost never. ``engine``
+    may itself be ``None`` (a failure before ``WorkflowEngine`` was
+    constructed), in which case the totals are left ``None``/``0``.
+
+    Never raises: a diagnostic write must not break the dashboard/event-log
+    cleanup that runs immediately after this in the same ``finally`` block.
+    """
+    if event_log_subscriber is None:
+        return
+    if workflow_path is None:
+        # Defensive only: every call path constructs `event_log_subscriber`
+        # strictly after resolving its workflow path, so this should be
+        # unreachable in practice -- but a diagnostic write must not raise
+        # an `AttributeError` on `workflow_path.stem` below if it somehow
+        # is.
+        logger.warning("Terminal run record skipped: no workflow_path available")
+        return
+
+    from conductor.fleet.records import TerminalRunRecord, write_terminal_record
+
+    total_tokens: int | None = None
+    total_cost_usd: float | None = None
+    unpriced_agent_count = 0
+    if engine is not None:
+        try:
+            usage = engine.get_execution_summary().get("usage")
+        except Exception:
+            logger.warning("Failed to read usage summary for terminal run record", exc_info=True)
+            usage = None
+        if usage is not None:
+            total_tokens = usage.get("total_tokens")
+            total_cost_usd = usage.get("total_cost_usd")
+            unpriced_agent_count = usage.get("unpriced_agent_count", 0)
+
+    try:
+        write_terminal_record(
+            TerminalRunRecord(
+                run_id=event_log_subscriber.run_id,
+                workflow_path=str(workflow_path),
+                workflow_name=workflow_path.stem,
+                started_at=started_at,
+                ended_at=datetime.now(UTC).isoformat(),
+                status=status,
+                output=output,
+                error_type=error_type,
+                error_message=error_message,
+                total_tokens=total_tokens,
+                total_cost_usd=total_cost_usd,
+                unpriced_agent_count=unpriced_agent_count,
+                event_log_path=str(event_log_subscriber.path),
+                bg_stderr_log=os.environ.get("CONDUCTOR_BG_STDERR_LOG"),
+                bg_stdout_log=os.environ.get("CONDUCTOR_BG_STDOUT_LOG"),
+            )
+        )
+    except Exception:
+        logger.warning("Failed to write terminal run record", exc_info=True)
+
+
 async def run_workflow_async(
     workflow_path: Path,
     inputs: dict[str, Any],
@@ -1957,6 +2209,10 @@ async def run_workflow_async(
     from conductor.events import WorkflowEventEmitter
 
     start_time = time.time()
+    # Captured once, up front, so the terminal run record (MCP server plan
+    # E2) reports the same start time regardless of which exit path below
+    # actually writes it.
+    started_at_iso = datetime.now(UTC).isoformat()
 
     # Initialize file logging if requested
     if log_file is not None:
@@ -1972,7 +2228,19 @@ async def run_workflow_async(
     # Always create event emitter and JSONL log subscriber
     emitter = WorkflowEventEmitter()
     event_log_subscriber: Any = None
+    telemetry_subscriber: Any = None
     dashboard: Any = None
+
+    # Terminal-outcome locals (MCP server plan E2): populated on every exit
+    # path below -- clean completion, an explicit `WorkflowTerminated`, or
+    # an unexpected exception -- so the `finally` block can write a
+    # terminal run record describing whichever outcome actually occurred,
+    # even when it happens before the engine is ever constructed.
+    terminal_status = "failed"
+    terminal_output: dict[str, Any] = {}
+    terminal_error_type: str | None = None
+    terminal_error_message: str | None = None
+    engine: WorkflowEngine | None = None
 
     if web:
         from conductor.web.server import WebDashboard
@@ -2056,6 +2324,16 @@ async def run_workflow_async(
 
         event_log_subscriber = EventLogSubscriber(config.workflow.name)
         emitter.subscribe(event_log_subscriber.on_event)
+
+        from conductor.telemetry.setup import init_tracer_provider
+        from conductor.telemetry.subscriber import TelemetrySubscriber
+
+        telemetry_subscriber = TelemetrySubscriber(
+            init_tracer_provider(
+                run_id=event_log_subscriber.run_id,
+            )
+        )
+        emitter.subscribe(telemetry_subscriber.on_event)
 
         # Write the Fleet Manager run record (E2): this is the first point
         # where run_id, event_log_path, and the already-started dashboard's
@@ -2218,6 +2496,18 @@ async def run_workflow_async(
                 if listener is not None:
                     await listener.stop()
 
+            # Capture the terminal outcome for the Fleet Manager terminal
+            # run record (MCP server plan E2) -- both a clean completion
+            # and an explicit `type: terminate` reach this point, so this
+            # is the one place that covers both.
+            terminal_output = result
+            if terminate_exc is None:
+                terminal_status = "success"
+            else:
+                terminal_status = "failed"
+                terminal_error_type = "WorkflowTerminated"
+                terminal_error_message = terminate_exc.reason
+
             # Log completion
             verbose_log_timing("Total workflow execution", time.time() - start_time)
             if terminate_exc is None:
@@ -2268,7 +2558,35 @@ async def run_workflow_async(
                 # and prints the structured termination message/output.
                 raise terminate_exc
             return result
+    except BaseException as exc:
+        if not isinstance(exc, WorkflowTerminated):
+            # An unexpected failure -- either a setup error before the
+            # engine ever ran (config load, plugin prefetch, dashboard
+            # startup, ...) or one that escaped the inner try/except above.
+            # `WorkflowTerminated` is excluded: its terminal outcome was
+            # already captured where it was raised, above, and re-raising
+            # it here must not clobber that with a generic "failed"/no
+            # message (MCP server plan E2).
+            terminal_status = "failed"
+            terminal_error_type = type(exc).__name__
+            terminal_error_message = str(exc)
+        raise
     finally:
+        # Write the terminal run record (MCP server plan E2) before
+        # removing the live one below, so a completed run remains
+        # resolvable by run_id after this process exits. Never raises --
+        # see the helper's own docstring.
+        _write_terminal_record_for_current_process(
+            event_log_subscriber=event_log_subscriber,
+            workflow_path=workflow_path,
+            started_at=started_at_iso,
+            status=terminal_status,
+            output=terminal_output,
+            error_type=terminal_error_type,
+            error_message=terminal_error_message,
+            engine=engine,
+        )
+
         # Clean up the Fleet Manager run record on every exit path (E2 —
         # normal completion, an explicit WorkflowTerminated re-raise, or an
         # unexpected exception all funnel through this finally). Unlike the
@@ -2279,21 +2597,39 @@ async def run_workflow_async(
         # dashboard/event-log/file-logging cleanup below from running.
         _remove_run_record_for_current_process_safe()
 
-        # Stop dashboard if it was started
         if dashboard is not None:
-            await dashboard.stop()
+            try:
+                await dashboard.stop()
+            except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+                logger.warning("Failed to stop dashboard during workflow cleanup", exc_info=True)
+
+        if telemetry_subscriber is not None:
+            # Spans still open here never saw a terminal workflow event
+            # (interrupt/cancellation escaping the engine) — mark them
+            # failed rather than let them read as clean completions.
+            telemetry_subscriber.close(
+                failed=terminal_status != "success",
+                error_type=terminal_error_type,
+                error_message=terminal_error_message,
+            )
 
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
-            event_log_subscriber.close()
-            _verbose_console.print(
-                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
-            )
+            try:
+                event_log_subscriber.close()
+                _verbose_console.print(
+                    styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+                )
+            except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+                logger.warning("Failed to close workflow event log", exc_info=True)
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
             _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
-        close_file_logging()
+        try:
+            close_file_logging()
+        except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+            logger.warning("Failed to close workflow file logging", exc_info=True)
 
 
 def format_routes(routes: list[dict[str, Any]]) -> Text:
@@ -2474,12 +2810,14 @@ def build_dry_run_plan(workflow_path: Path) -> ExecutionPlan:
             agent: AgentDef,
             context: dict[str, Any],
             rendered_prompt: str,
+            *,
             tools: list[str] | None = None,
             interrupt_signal: asyncio.Event | None = None,
             event_callback: Any = None,
             skill_directories: list[str] | None = None,
             custom_agents: list[dict[str, Any]] | None = None,
             extra_mcp_servers: dict[str, Any] | None = None,
+            continuation_state: object | None = None,
         ) -> AgentOutput:
             return AgentOutput(content={}, raw_response="")
 
@@ -2590,6 +2928,12 @@ async def resume_workflow_async(
     from conductor.exceptions import CheckpointError
 
     start_time = time.time()
+    # Captured once, up front, so the terminal run record (MCP server plan
+    # E2) reports the same start time regardless of which exit path below
+    # actually writes it. Note this is the *resume* start time, not the
+    # original run's -- the checkpoint's own timestamps are preserved
+    # separately in the checkpoint file itself.
+    started_at_iso = datetime.now(UTC).isoformat()
 
     # Initialize file logging if requested
     if log_file is not None:
@@ -2605,7 +2949,20 @@ async def resume_workflow_async(
     # Always create event emitter and JSONL log subscriber (parity with run)
     emitter = WorkflowEventEmitter()
     event_log_subscriber: Any = None
+    telemetry_subscriber: Any = None
     dashboard: Any = None
+
+    # Terminal-outcome locals (MCP server plan E2), mirroring
+    # `run_workflow_async`: populated on every exit path below so the
+    # `finally` block can write a terminal run record describing whichever
+    # outcome actually occurred, even when it happens before
+    # `resolved_workflow_path`/the engine are ever established.
+    terminal_status = "failed"
+    terminal_output: dict[str, Any] = {}
+    terminal_error_type: str | None = None
+    terminal_error_message: str | None = None
+    engine: WorkflowEngine | None = None
+    resolved_workflow_path: Path | None = None
 
     try:
         # Resolve checkpoint file
@@ -2772,6 +3129,17 @@ async def resume_workflow_async(
             )
             emitter.subscribe(event_log_subscriber.on_event)
 
+            from conductor.telemetry.setup import init_tracer_provider
+            from conductor.telemetry.subscriber import TelemetrySubscriber
+
+            telemetry_subscriber = TelemetrySubscriber(
+                init_tracer_provider(
+                    run_id=event_log_subscriber.run_id,
+                ),
+                resumed=True,
+            )
+            emitter.subscribe(telemetry_subscriber.on_event)
+
             # Write the Fleet Manager run record immediately, before any
             # further setup (dashboard seeding, engine construction) that
             # could take an arbitrary amount of time. `existing_log_path`
@@ -2850,6 +3218,11 @@ async def resume_workflow_async(
                 from conductor.events import WorkflowEvent
 
                 event_log_subscriber.on_event(
+                    WorkflowEvent(
+                        type="workflow_started", timestamp=time.time(), data=workflow_started_data
+                    )
+                )
+                telemetry_subscriber.on_event(
                     WorkflowEvent(
                         type="workflow_started", timestamp=time.time(), data=workflow_started_data
                     )
@@ -2965,6 +3338,17 @@ async def resume_workflow_async(
                 if listener is not None:
                     await listener.stop()
 
+            # Capture the terminal outcome for the Fleet Manager terminal
+            # run record (MCP server plan E2) -- mirrors the equivalent
+            # block in `run_workflow_async`.
+            terminal_output = result
+            if terminate_exc is None:
+                terminal_status = "success"
+            else:
+                terminal_status = "failed"
+                terminal_error_type = "WorkflowTerminated"
+                terminal_error_message = terminate_exc.reason
+
             # Log completion
             verbose_log_timing("Total resumed execution", time.time() - start_time)
             if terminate_exc is None:
@@ -3016,7 +3400,34 @@ async def resume_workflow_async(
             if terminate_exc is not None:
                 raise terminate_exc
             return result
+    except BaseException as exc:
+        if not isinstance(exc, WorkflowTerminated):
+            # Mirror of the matching arm in `run_workflow_async`: capture
+            # any failure that didn't already flow through the
+            # `WorkflowTerminated` branch above -- a setup error before the
+            # engine ever ran (checkpoint resolution, config load, ...) or
+            # one that escaped the inner try/except (MCP server plan E2).
+            terminal_status = "failed"
+            terminal_error_type = type(exc).__name__
+            terminal_error_message = str(exc)
+        raise
     finally:
+        # Write the terminal run record (MCP server plan E2) before
+        # removing the live one below -- mirrors run_workflow_async. A
+        # resumed run reuses its predecessor's run_id, so this call
+        # replaces the earlier terminal record rather than duplicating it.
+        # Never raises -- see the helper's own docstring.
+        _write_terminal_record_for_current_process(
+            event_log_subscriber=event_log_subscriber,
+            workflow_path=resolved_workflow_path,
+            started_at=started_at_iso,
+            status=terminal_status,
+            output=terminal_output,
+            error_type=terminal_error_type,
+            error_message=terminal_error_message,
+            engine=engine,
+        )
+
         # Clean up the Fleet Manager run record on every exit path (E2 —
         # mirrors run_workflow_async so a resumed run's record is removed
         # the same way a fresh run's is). Guarded (never raises) so a
@@ -3024,21 +3435,36 @@ async def resume_workflow_async(
         # cleanup below from running.
         _remove_run_record_for_current_process_safe()
 
-        # Stop dashboard if it was started
         if dashboard is not None:
-            await dashboard.stop()
+            try:
+                await dashboard.stop()
+            except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+                logger.warning("Failed to stop dashboard during resume cleanup", exc_info=True)
+
+        if telemetry_subscriber is not None:
+            telemetry_subscriber.close(
+                failed=terminal_status != "success",
+                error_type=terminal_error_type,
+                error_message=terminal_error_message,
+            )
 
         # Close JSONL event log and report path
         if event_log_subscriber is not None:
-            event_log_subscriber.close()
-            _verbose_console.print(
-                styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
-            )
+            try:
+                event_log_subscriber.close()
+                _verbose_console.print(
+                    styled("[dim]Event log written to: {}[/dim]", event_log_subscriber.path)
+                )
+            except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+                logger.warning("Failed to close resumed workflow event log", exc_info=True)
 
         # Report log file path to stderr and close file logging
         if log_file is not None and _file_console is not None:
             _verbose_console.print(styled("[dim]Log written to: {}[/dim]", log_file))
-        close_file_logging()
+        try:
+            close_file_logging()
+        except Exception:  # noqa: BLE001 -- teardown must preserve the workflow outcome.
+            logger.warning("Failed to close resumed workflow file logging", exc_info=True)
 
 
 async def _prefetch_plugin_sources(config: Any, workflow_path: Path) -> dict[str, Any]:

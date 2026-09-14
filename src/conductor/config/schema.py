@@ -17,6 +17,7 @@ from pydantic import (
     Field,
     SecretStr,
     StringConstraints,
+    ValidationInfo,
     ValidatorFunctionWrapHandler,
     field_validator,
     model_serializer,
@@ -90,6 +91,42 @@ class InputDef(BaseModel):
                 f"default value must be of type '{type_value}', got {type(v).__name__}"
             )
 
+        return v
+
+
+class McpConfig(BaseModel):
+    """Per-workflow configuration for exposure as an MCP tool.
+
+    Backs ``WorkflowDef.mcp`` (E6, DD4, FR11): a typed, validated block so a
+    typo (``expse: false``) is a schema error rather than silently ignored
+    ``metadata``. Every workflow is a candidate for exposure by default
+    (``expose: True``); ``conductor mcp serve``'s ``--allow``/``--deny``
+    flags outrank this block, which in turn outranks the default.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    expose: bool = True
+    """Whether this workflow is a candidate for MCP tool exposure."""
+
+    mode: Literal["async", "sync", "auto"] = "async"
+    """Invocation mode the MCP server should use for this workflow."""
+
+    read_only: bool = False
+    """Whether this workflow only reads state (no side effects)."""
+
+    destructive: bool = False
+    """Whether this workflow can destroy or irreversibly modify state."""
+
+    estimated_minutes: int | None = None
+    """Estimated wall-clock runtime in minutes, for client-side hints."""
+
+    @field_validator("estimated_minutes")
+    @classmethod
+    def validate_estimated_minutes(cls, v: int | None) -> int | None:
+        """Reject a non-positive estimate rather than silently accepting one."""
+        if v is not None and v <= 0:
+            raise ValueError("estimated_minutes must be positive when present")
         return v
 
 
@@ -594,19 +631,6 @@ class CostConfig(BaseModel):
     """Custom pricing overrides for specific models."""
 
 
-class HooksConfig(BaseModel):
-    """Lifecycle hooks for workflow events."""
-
-    on_start: str | None = None
-    """Expression evaluated when workflow starts."""
-
-    on_complete: str | None = None
-    """Expression evaluated when workflow completes successfully."""
-
-    on_error: str | None = None
-    """Expression evaluated when workflow fails."""
-
-
 class RetryPolicy(BaseModel):
     """Per-agent retry policy for transient failure resilience.
 
@@ -701,9 +725,12 @@ class ValidatorConfig(BaseModel):
     (``{"passed": bool, "issues": [str, ...]}``).
 
     If the validator returns ``passed: false`` and ``max_retries > 0``, the
-    primary agent is re-run **once** with the validator's feedback appended
-    to its prompt. The second output is taken as final — there is no second
-    validation loop.
+    primary agent is re-run **once** and the second output is taken as
+    final — there is no second validation loop. On the ``claude``,
+    ``openai``, and ``hermes`` providers the re-run continues the completed
+    conversation,
+    with the validator's feedback as the next user turn; other providers
+    rebuild the prompt with the feedback appended.
 
     This is distinct from ``retry:`` (transient/provider failures, same
     prompt) and the ``output:`` schema (shape/type, not content quality).
@@ -1159,6 +1186,10 @@ class AgentDef(BaseModel):
       ``args``, ``env``, ``working_dir``, ``timeout``. Output is always
       ``{stdout, stderr, exit_code}`` with parsed-JSON keys merged on top
       when ``stdout`` is valid JSON.
+    - ``mcp``: Direct MCP tool call (no LLM). Requires ``server`` (a name
+      from ``runtime.mcp_servers``) and ``tool``; supports ``arguments``,
+      ``output``, ``routes``, and ``timeout``. Both ``server`` and ``tool``
+      must be literal — Jinja2 templates are rejected at load time.
     - ``workflow``: Sub-workflow black-box step. Requires ``workflow:``
       (path or registry reference); supports ``input_mapping`` and
       ``max_depth``.
@@ -1188,6 +1219,7 @@ class AgentDef(BaseModel):
         Literal[
             "agent",
             "human_gate",
+            "mcp",
             "questions",
             "script",
             "set",
@@ -1358,6 +1390,83 @@ class AgentDef(BaseModel):
     wait/set/terminate/human_gate/workflow step types.
     """
 
+    settings_dir: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)] | None = (
+        None
+    )
+    """Directory whose ``.claude/skills`` this agent may use, and whose tree the
+    model's built-in file tools may read.
+
+    Both halves of that first line are deliberate: this carries the *skills*
+    third of a Claude Code ``project`` settings tier and nothing else of it,
+    and it widens the model's filesystem access unconditionally. Details below.
+
+    ``claude-agent-sdk`` only -- a provider that cannot apply it refuses it
+    both at ``conductor validate`` and at run time, rather than dropping it
+    silently (``conductor run`` never calls the static validator). Resolved
+    by the engine exactly like :attr:`working_dir` (Jinja-rendered,
+    ``~``-expanded, made absolute against the workflow file's directory,
+    ``normpath``-normalised, existence-checked), then forwarded to the SDK as
+    ``ClaudeAgentOptions.add_dirs``. Rejected on
+    wait/set/terminate/script/human_gate/questions/workflow step types.
+
+    **Two effects, and only one of them is conditional.** Skill discovery
+    requires ``runtime.provider.setting_sources`` to enable the ``project``
+    tier; both ``conductor validate`` and the run itself warn when this field
+    is set without it, since the skills half is then a no-op and
+    ``conductor run`` never calls the static validator. The *filesystem* grant is
+    unconditional: ``add_dirs``' own SDK contract is "additional directories
+    Claude can access beyond the current working directory", so naming a
+    directory here widens the model's built-in ``Read``/``Edit``/``Bash``
+    tools to that tree regardless of any settings tier. It does **not** widen
+    what a filesystem MCP server permits -- that stays cwd alone, which is why
+    this field exists.
+
+    That grant is currently latent rather than reachable from a workflow:
+    Conductor runs this provider either with the full ``claude_code`` preset
+    under ``bypassPermissions`` (``tools:`` omitted), where reads already
+    succeed everywhere, or with ``tools: []``, where the model holds at most
+    the ``Skill`` loader and no file tool at all. So it is a property of the
+    SDK contract to design against rather than an exposure today. Point it
+    only at a directory the agent may read.
+
+    It exists because ``working_dir`` was doing two unrelated jobs. The CLI
+    supports MCP Roots and advertises exactly one root — its cwd — so a
+    filesystem MCP server discards the directories in its own argv and
+    permits cwd alone. That makes cwd the *only* handle on what an agent can
+    read, while it is simultaneously the directory the ``project`` settings
+    tier resolves against. Narrowing cwd onto a target repository to pick up
+    that repository's skills therefore also narrowed the MCP root below any
+    sibling path the step still had to read, and widening it back lost the
+    repository's conventions.
+
+    ``settings_dir`` splits them: the *skills* of every directory named here
+    are discovered and invocable regardless of cwd, so cwd can stay wide
+    enough to contain everything the agent must read.
+
+    The split is not total, and the remainder is deliberate. A directory
+    named here contributes its ``.claude/skills`` and nothing else — not
+    ``CLAUDE.md``, not ``.claude/rules/*.md``, not ``.claude/settings.json``
+    (so no ``env`` and no ``hooks``), not ``.claude/agents``, all of which
+    continue to follow cwd. This field is the *skills* portion of a project
+    tier, not a cwd-independent way to load one: instructions, rules and
+    hooks still require ``working_dir`` pointed at the directory.
+
+    So the two fields do not compose into "everything, anywhere". An agent
+    needing a target repository's rules *and* a cwd wide enough for its MCP
+    servers cannot have both from these fields alone -- one directory cannot
+    be simultaneously narrow and wide. ``settings_dir`` recovers the skills;
+    the rest is a caller-side trade.
+
+    Example — a judge reviewing a target repository while reading artifacts
+    from a sibling directory::
+
+        agents:
+          - name: judge
+            settings_dir: "{{ setup_worktree.output.worktree_path }}"
+            # No working_dir: cwd stays the launch directory, which contains
+            # both the worktree and the artifacts the judge must read.
+    """
+
     stdin: str | None = None
     """Payload written to the script subprocess's stdin (script type only).
 
@@ -1381,7 +1490,31 @@ class AgentDef(BaseModel):
     """
 
     timeout: int | None = None
-    """Per-script timeout in seconds."""
+    """Per-call timeout in seconds (script subprocess or MCP tool call)."""
+
+    server: str | None = None
+    """MCP server name to call (required for ``type='mcp'`` steps).
+
+    Must name a server declared in ``workflow.runtime.mcp_servers``. Never
+    Jinja2-rendered — a template is rejected at load time (see
+    :meth:`validate_mcp_fields_are_literal`), because static validation of
+    the server/tool pair is only possible on literal values.
+    """
+
+    tool: str | None = None
+    """Tool name to invoke on the MCP server (required for ``type='mcp'`` steps).
+
+    Never Jinja2-rendered — a template is rejected at load time for the same
+    reason as :attr:`server`.
+    """
+
+    arguments: dict[str, Any] | None = None
+    """Optional argument mapping passed to the MCP tool (``type='mcp'`` only).
+
+    String values (at any nesting depth) are Jinja2-rendered recursively
+    against the workflow context before the call; other JSON scalars pass
+    through unchanged. ``None`` calls the tool with no arguments.
+    """
 
     duration: str | int | float | None = None
     """Duration to pause for ``type='wait'`` steps.
@@ -1832,6 +1965,24 @@ class AgentDef(BaseModel):
             raise ValueError("timeout must be a positive integer")
         return v
 
+    @field_validator("server", "tool", mode="before")
+    @classmethod
+    def validate_mcp_fields_are_literal(cls, v: Any, info: ValidationInfo) -> Any:
+        """Reject a Jinja2 template in ``server`` / ``tool`` (type: mcp steps).
+
+        Neither field is ever rendered, and static validation of the
+        server/tool pair (declared server exists, tool is on its allowlist)
+        is only possible on literal values — a template would defer that
+        check entirely to runtime.
+        """
+        if isinstance(v, str) and ("{{" in v or "{%" in v):
+            raise ValueError(
+                f"{info.field_name} {v!r} looks like a Jinja2 template, but "
+                f"{info.field_name} is never rendered — static validation of the "
+                f"server/tool pair requires a literal value. Use a static name."
+            )
+        return v
+
     @field_validator("session_key")
     @classmethod
     def validate_session_key_is_literal(cls, v: str | None) -> str | None:
@@ -1948,6 +2099,18 @@ class AgentDef(BaseModel):
                 "(only 'script' agents support this field)"
             )
 
+        # Fields exclusive to ``type: mcp`` — a standalone guard, like the
+        # terminate/script/questions ones above, so it also covers types with
+        # no branch of their own (the ``mcp`` branch below only rejects
+        # fields, it cannot reject its own required ones on other types).
+        if self.type != "mcp":
+            for field_name in ("server", "tool", "arguments"):
+                if getattr(self, field_name) is not None:
+                    raise ValueError(
+                        f"'{self.type or 'agent'}' agents cannot have '{field_name}' "
+                        "(only 'mcp' agents support this field)"
+                    )
+
         # Fields exclusive to ``type: questions``. A standalone guard, like the
         # terminate/script ones above, so it also covers types with no branch
         # of their own. The nav flags are tri-state (``bool | None``) precisely
@@ -2007,6 +2170,8 @@ class AgentDef(BaseModel):
                 raise ValueError("human_gate agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("human_gate agents cannot have 'working_dir'")
+            if self.settings_dir is not None:
+                raise ValueError("human_gate agents cannot have 'settings_dir'")
             if self.session_key is not None:
                 raise ValueError("human_gate agents cannot have 'session_key'")
         elif self.type == "questions":
@@ -2070,6 +2235,8 @@ class AgentDef(BaseModel):
                 raise ValueError("questions agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("questions agents cannot have 'working_dir'")
+            if self.settings_dir is not None:
+                raise ValueError("questions agents cannot have 'settings_dir'")
             if self.session_key is not None:
                 raise ValueError("questions agents cannot have 'session_key'")
         elif self.type == "script":
@@ -2103,6 +2270,8 @@ class AgentDef(BaseModel):
                 raise ValueError("script agents cannot have 'validator'")
             if self.sandbox is not None:
                 raise ValueError("script agents cannot have 'sandbox'")
+            if self.settings_dir is not None:
+                raise ValueError("script agents cannot have 'settings_dir'")
             if self.max_depth is not None:
                 raise ValueError("script agents cannot have 'max_depth'")
             if self.reasoning is not None:
@@ -2169,6 +2338,96 @@ class AgentDef(BaseModel):
                 raise ValueError("workflow agents cannot have 'output_mode'")
             if self.working_dir:
                 raise ValueError("workflow agents cannot have 'working_dir'")
+            if self.settings_dir is not None:
+                raise ValueError("workflow agents cannot have 'settings_dir'")
+        elif self.type == "mcp":
+            # Required fields.
+            if not self.server:
+                raise ValueError("mcp agents require 'server'")
+            if not self.tool:
+                raise ValueError("mcp agents require 'tool'")
+            # Field matrix for ``type: mcp`` — every AgentDef field is
+            # accounted for below so future fields cannot silently leak:
+            #   ALLOWED (no check): name, description, type, input, output,
+            #       routes, timeout (per-call seconds — unlike wait/set,
+            #       an MCP call has no other timeout knob), server, tool,
+            #       arguments
+            #   FORBIDDEN (checked here): prompt, system_prompt, provider,
+            #       model, tools, reasoning, context_tier, skills, plugins,
+            #       validator, dialog, sandbox, session_key,
+            #       max_agent_iterations, max_session_seconds, output_mode,
+            #       retry, timeout_seconds, command, args, env, working_dir,
+            #       settings_dir, options, workflow, input_mapping, max_depth,
+            #       value, values, output_type
+            #   COVERED BY STANDALONE GUARDS (no check needed here):
+            #       stdin (script guard above), duration + reason
+            #       (wait/terminate guard at the bottom of this method),
+            #       status + output_template (terminate guard above),
+            #       questions/source/allow_*/abort_route (questions guard
+            #       above), server/tool/arguments on non-mcp types (guard
+            #       above)
+            if self.prompt:
+                raise ValueError("mcp agents cannot have 'prompt'")
+            if self.provider:
+                raise ValueError("mcp agents cannot have 'provider'")
+            if self.model:
+                raise ValueError("mcp agents cannot have 'model'")
+            if self.tools is not None:
+                raise ValueError("mcp agents cannot have 'tools'")
+            if self.system_prompt:
+                raise ValueError("mcp agents cannot have 'system_prompt'")
+            if self.options:
+                raise ValueError("mcp agents cannot have 'options'")
+            if self.command:
+                raise ValueError("mcp agents cannot have 'command'")
+            if self.args:
+                raise ValueError("mcp agents cannot have 'args'")
+            if self.env:
+                raise ValueError("mcp agents cannot have 'env'")
+            if self.working_dir:
+                raise ValueError("mcp agents cannot have 'working_dir'")
+            if self.settings_dir is not None:
+                raise ValueError("mcp agents cannot have 'settings_dir'")
+            if self.workflow:
+                raise ValueError("mcp agents cannot have 'workflow'")
+            if self.input_mapping is not None:
+                raise ValueError("mcp agents cannot have 'input_mapping'")
+            if self.max_depth is not None:
+                raise ValueError("mcp agents cannot have 'max_depth'")
+            if self.max_session_seconds:
+                raise ValueError("mcp agents cannot have 'max_session_seconds'")
+            if self.max_agent_iterations is not None:
+                raise ValueError("mcp agents cannot have 'max_agent_iterations'")
+            if self.session_key is not None:
+                raise ValueError("mcp agents cannot have 'session_key'")
+            if self.retry is not None:
+                raise ValueError("mcp agents cannot have 'retry'")
+            if self.dialog is not None:
+                raise ValueError("mcp agents cannot have 'dialog'")
+            if self.validator is not None:
+                raise ValueError("mcp agents cannot have 'validator'")
+            if self.sandbox is not None:
+                raise ValueError("mcp agents cannot have 'sandbox'")
+            if self.reasoning is not None:
+                raise ValueError("mcp agents cannot have 'reasoning'")
+            if self.context_tier is not None:
+                raise ValueError("mcp agents cannot have 'context_tier'")
+            if self.skills is not None:
+                raise ValueError("mcp agents cannot have 'skills'")
+            if self.plugins is not None:
+                raise ValueError("mcp agents cannot have 'plugins'")
+            if self.timeout_seconds is not None:
+                raise ValueError(
+                    "mcp agents cannot have 'timeout_seconds' (use 'timeout' for mcp call timeouts)"
+                )
+            if self.output_mode is not None:
+                raise ValueError("mcp agents cannot have 'output_mode'")
+            if self.value is not None:
+                raise ValueError("mcp agents cannot have 'value' (only 'set' agents do)")
+            if self.values is not None:
+                raise ValueError("mcp agents cannot have 'values' (only 'set' agents do)")
+            if self.output_type is not None:
+                raise ValueError("mcp agents cannot have 'output_type' (only 'set' agents do)")
         elif self.type == "wait":
             if self.duration is None:
                 raise ValueError("wait agents require 'duration'")
@@ -2192,6 +2451,8 @@ class AgentDef(BaseModel):
                 raise ValueError("wait agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("wait agents cannot have 'working_dir'")
+            if self.settings_dir is not None:
+                raise ValueError("wait agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("wait agents cannot have 'timeout'")
             if self.workflow:
@@ -2265,6 +2526,8 @@ class AgentDef(BaseModel):
                 raise ValueError("set agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("set agents cannot have 'working_dir'")
+            if self.settings_dir is not None:
+                raise ValueError("set agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("set agents cannot have 'timeout'")
             if self.workflow:
@@ -2339,6 +2602,8 @@ class AgentDef(BaseModel):
                 raise ValueError("terminate agents cannot have 'env'")
             if self.working_dir:
                 raise ValueError("terminate agents cannot have 'working_dir'")
+            if self.settings_dir is not None:
+                raise ValueError("terminate agents cannot have 'settings_dir'")
             if self.timeout is not None:
                 raise ValueError("terminate agents cannot have 'timeout'")
             if self.timeout_seconds is not None:
@@ -2676,11 +2941,19 @@ class ProviderSettings(BaseModel):
     installed, so a run reproduces on another developer's laptop.
 
     Set it to opt a workflow back in. The motivating case is an agent working
-    inside a *target* repository that ships its own ``.claude/skills`` — with
-    ``working_dir`` pointed at that repo, ``["project"]`` loads that repo's
-    skills and instructions natively, without the repo needing to package
-    them as a Claude Code plugin (the CLI has ``--plugin-dir`` but no
-    ``--skill-dir``, so a plugin root is otherwise the only handle).
+    against a *target* repository that ships its own ``.claude/skills``:
+    ``["project"]`` loads that repository's skills natively, without it
+    needing to package them as a Claude Code plugin (the CLI has
+    ``--plugin-dir`` but no ``--skill-dir``, so a plugin root is otherwise
+    the only handle).
+
+    Which directory the ``project`` tier reads is chosen per agent. Skills
+    come from cwd (:attr:`AgentDef.working_dir`) *and* from
+    :attr:`AgentDef.settings_dir`; everything else the tier defines --
+    ``CLAUDE.md``, ``.claude/settings.json``, ``.claude/agents`` — follows
+    cwd alone. Prefer ``settings_dir`` when the agent also needs a wider cwd:
+    the CLI advertises cwd as its sole MCP root, so narrowing cwd onto the
+    target repository narrows what the agent's MCP servers may read.
 
     Each tier brings everything that tier defines, hooks included: ``project``
     reads ``<cwd>/.claude/settings.json``, whose ``hooks`` entries run
@@ -2690,6 +2963,13 @@ class ProviderSettings(BaseModel):
     ``user`` additionally reads ``~/.claude/settings.json``, which makes a run
     depend on the operator's personal machine — reproducible only by
     accident. Prefer ``["project"]``.
+
+    Scope: this field is workflow-global, while ``working_dir`` is per agent,
+    so every agent on the provider loads the enabled tiers — each resolving
+    them against its own ``working_dir``, and agents without one against the
+    directory ``conductor run`` was launched in. Point the tier-using agents
+    at the target repo, and give any agent that must stay hermetic an explicit
+    ``skills: []``, which opts that agent out of the tiers entirely.
 
     Example::
 
@@ -2883,6 +3163,13 @@ class ProviderSettings(BaseModel):
             if extras:
                 raise ValueError(f"Provider fields {extras} are only supported when name='aca'.")
 
+        if self.setting_sources is not None and self.name != "claude-agent-sdk":
+            raise ValueError(
+                "'setting_sources' is only supported when name='claude-agent-sdk' "
+                f"(got name={self.name!r}). It selects Claude Code settings tiers, "
+                "which no other provider reads."
+            )
+
         if self.hermes_home is not None and self.name != "hermes":
             raise ValueError("'hermes_home' is only supported when name='hermes'.")
 
@@ -3061,7 +3348,12 @@ class ProviderSettings(BaseModel):
 
     def has_structured_config(self) -> bool:
         """Return True when the provider has any non-default structured settings."""
-        return self.has_custom_routing() or self.has_external_runtime() or self.has_aca_config()
+        return (
+            self.has_custom_routing()
+            or self.has_external_runtime()
+            or self.has_aca_config()
+            or self.setting_sources is not None
+        )
 
     @model_serializer(mode="wrap")
     def _serialize(self, nxt: Any) -> Any:
@@ -3365,6 +3657,16 @@ class RuntimeConfig(BaseModel):
 
     model_config = ConfigDict(validate_assignment=True)
 
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_telemetry(cls, value: Any) -> Any:
+        if isinstance(value, dict) and "telemetry" in value:
+            raise ValueError(
+                "runtime.telemetry was removed; tracing is enabled via the "
+                "OTEL_EXPORTER_OTLP_ENDPOINT environment variable"
+            )
+        return value
+
     provider: ProviderSettings = Field(default_factory=ProviderSettings)
     """SDK provider configuration.
 
@@ -3401,7 +3703,7 @@ class RuntimeConfig(BaseModel):
         le=200000,
         description=(
             "Maximum OUTPUT tokens generated per response (NOT context window limit). "
-            "Claude 4: max 8192 (Opus/Sonnet) or 4096 (Haiku). "
+            "When omitted, the Claude and OpenAI providers apply a unified default of 16384. "
             "Context window: 200K tokens input+output combined (separate from this setting)"
         ),
     )
@@ -3410,7 +3712,8 @@ class RuntimeConfig(BaseModel):
     Note: This controls response length, NOT context window. Context trimming
     is handled separately by the workflow engine if needed.
 
-    Claude 4 limits: Opus/Sonnet 8192, Haiku 4096.
+    When omitted, the Claude and OpenAI providers apply a unified default of
+    16384 tokens per response.
     """
 
     timeout: float | None = Field(
@@ -3450,6 +3753,28 @@ class RuntimeConfig(BaseModel):
 
     Default is None, which uses the provider's built-in default
     (Claude: 50, Copilot: unlimited).
+    """
+
+    idle_timeout_seconds: float | None = Field(None, ge=1.0)
+    """Time without SDK events before a Copilot session is treated as idle.
+
+    Copilot provider only; other providers ignore this field. Default is
+    None, which uses the provider's built-in default (90s). A session is
+    only considered idle when no SDK events at all have arrived within the
+    window — an in-flight tool call (between ``tool.execution_start`` and
+    ``tool.execution_complete``) suppresses the check entirely, since most
+    tools emit nothing during execution (see
+    ``IdleRecoveryConfig.idle_timeout_seconds`` in ``providers/copilot.py``
+    for the full rationale).
+    """
+
+    max_idle_recovery_attempts: int | None = Field(None, ge=0)
+    """Maximum number of "please continue" prompts sent to an idle Copilot session.
+
+    Copilot provider only; other providers ignore this field. Default is
+    None, which uses the provider's built-in default (5). ``0`` means the
+    session fails on the first genuine idle timeout without ever injecting
+    a recovery prompt.
     """
 
     default_reasoning_effort: ReasoningEffort | None = None
@@ -3643,10 +3968,38 @@ class RuntimeConfig(BaseModel):
         return _validate_skill_entries(v)
 
 
+_REMOVED_WORKFLOW_FIELDS: dict[str, str] = {
+    "hooks": (
+        "`workflow.hooks:` (on_start/on_complete/on_error) was removed in #476. "
+        "The hook templates were rendered and then discarded, so the block never "
+        "had any observable effect. Remove it from your workflow. For "
+        "completion or failure notification, subscribe to the `workflow_completed` "
+        "/ `workflow_failed` events in the JSONL event log instead."
+    ),
+}
+
+
 class WorkflowDef(BaseModel):
     """Top-level workflow configuration."""
 
     model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_removed_fields(cls, data: Any) -> Any:
+        """Give a targeted error for fields removed from the schema.
+
+        ``extra="forbid"`` already rejects an unknown ``hooks:`` key, but its
+        generic "extra inputs are not permitted" message reads like a typo and
+        points the user back at the (now-deleted) docs. Naming the removal and
+        the replacement keeps an upgrading workflow from silently misdiagnosing
+        the failure. See #476.
+        """
+        if isinstance(data, dict):
+            for key, guidance in _REMOVED_WORKFLOW_FIELDS.items():
+                if key in data:
+                    raise ValueError(guidance)
+        return data
 
     name: str
     """Unique workflow identifier."""
@@ -3675,8 +4028,13 @@ class WorkflowDef(BaseModel):
     cost: CostConfig = Field(default_factory=CostConfig)
     """Cost tracking configuration."""
 
-    hooks: HooksConfig | None = None
-    """Lifecycle event hooks."""
+    mcp: McpConfig = Field(default_factory=McpConfig)
+    """Exposure settings for ``conductor mcp serve``.
+
+    Absent from the YAML behaves identically to an explicit default block
+    (``expose: true``), so no existing workflow needs editing to keep its
+    current behavior once MCP exposure defaults on (DD4).
+    """
 
     metadata: dict[str, Any] = Field(default_factory=dict)
     """Arbitrary key-value metadata for external tooling (dashboards, trackers, etc.).

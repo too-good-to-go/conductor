@@ -17,6 +17,8 @@ workflow:
     max_tokens: 4096
     default_reasoning_effort: medium  # low | medium | high | xhigh | max (optional)
     default_context_tier: default  # default | long_context (optional, Copilot only)
+    idle_timeout_seconds: 90  # Copilot only (optional)
+    max_idle_recovery_attempts: 5  # Copilot only (optional)
     # Provider-specific settings...
 ```
 
@@ -30,6 +32,55 @@ The `default_context_tier` field sets a workflow-wide default for the model's
 context-window tier that every provider-backed agent inherits unless it
 declares its own `context_tier` override. See [Context Tier](#context-tier)
 for details. This is a Copilot-only capability.
+
+The `idle_timeout_seconds` and `max_idle_recovery_attempts` fields tune the
+Copilot provider's idle watchdog: when a session stops emitting SDK events
+for `idle_timeout_seconds` (default 90s), Conductor sends a "please continue"
+recovery prompt, up to `max_idle_recovery_attempts` times (default 5) before
+failing the session. A tool call that is still executing suppresses the
+watchdog — most tools emit nothing while running, so a stale idle clock
+during a long-running tool call usually means the tool is still running, not
+that the session is stuck. Suppression is bounded by `max_session_seconds`
+(default 1800s), which is still enforced while a tool is in flight and is the
+only limit that can end a genuinely hung tool call. Raise it alongside
+`idle_timeout_seconds` if your workflow has tool calls that legitimately run
+longer than 30 minutes. Both `idle_timeout_seconds` and
+`max_idle_recovery_attempts` are Copilot-only; other providers ignore them.
+
+### OpenTelemetry Tracing
+
+Conductor tracing is opt-in. Install the optional telemetry dependencies and
+configure an OTLP collector through standard OpenTelemetry environment
+variables:
+
+```bash
+uv sync --extra telemetry
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
+export OTEL_SERVICE_NAME=research-workflow
+```
+
+Each enabled run emits provider-independent spans for workflow, group, agent,
+step, and tool lifecycles. Conductor unifies high-level orchestration spans and
+native provider spans, for `copilot`, `claude`, and `openai` providers, into a single
+unified trace tree.
+
+The exporter uses gRPC by default. Set `OTEL_EXPORTER_OTLP_PROTOCOL` to
+`http/protobuf` or `http/json` when your collector expects OTLP/HTTP. Copilot CLI tracing
+requires an HTTP-based protocol. The service name is
+`OTEL_SERVICE_NAME` when set, otherwise `conductor`. `OTEL_SDK_DISABLED=true`
+disables tracing for the process.
+
+Conductor's own spans record execution metadata, not prompts or model
+responses. Native spans for `copilot`, `claude`, and `openai` also exclude message content by default.
+Prompt and response capture is disabled by default, but exception messages can contain input or
+response values — treat traces as potentially sensitive even with content capture disabled.
+Set `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` to `true`,
+`SPAN_ONLY`, or `SPAN_AND_EVENT` only after confirming that the collector and
+its retention policy are approved for prompt and response data. For details on how content capture behaves under different providers, see the [Copilot Provider telemetry documentation](telemetry.md#copilot-provider).
+
+Tracing is best effort: a missing telemetry extra, exporter initialization
+failure, or exporter shutdown failure logs a warning and never prevents the
+workflow from running.
 
 ## Provider Selection
 
@@ -47,6 +98,8 @@ workflow:
         command: npx
         args: ["-y", "open-websearch@latest"]
         tools: ["*"]
+    idle_timeout_seconds: 90
+    max_idle_recovery_attempts: 5
 ```
 
 **Features**:
@@ -181,18 +234,26 @@ neither env var. Only `base_url` falls back on its own.
 
 #### Field compatibility by provider
 
-| Field | `copilot` | `claude` |
-|---|---|---|
-| `base_url` | Supported | Supported |
-| `api_key` | Supported | Supported |
-| `auth_token` | Rejected | Supported |
-| `bearer_token` | Supported | Rejected |
-| `type` | Supported | Rejected |
-| `wire_api` | Supported | Rejected |
-| `headers` | Supported | Rejected |
-| `azure` | Supported | Rejected |
-| `runtime_url` | Supported | Rejected |
-| `runtime_token` | Supported | Rejected |
+| Field | `copilot` | `claude` | `claude-agent-sdk` |
+|---|---|---|---|
+| `base_url` | Supported | Supported | Rejected |
+| `api_key` | Supported | Supported | Rejected |
+| `auth_token` | Rejected | Supported | Rejected |
+| `bearer_token` | Supported | Rejected | Rejected |
+| `type` | Supported | Rejected | Rejected |
+| `wire_api` | Supported | Rejected | Rejected |
+| `headers` | Supported | Rejected | Rejected |
+| `azure` | Supported | Rejected | Rejected |
+| `runtime_url` | Supported | Rejected | Rejected |
+| `runtime_token` | Supported | Rejected | Rejected |
+| `setting_sources` | Rejected | Rejected | Supported |
+
+`setting_sources` (`user` / `project` / `local`) selects which Claude Code
+settings tiers a session may load; it is empty by default and only the
+`claude-agent-sdk` provider reads it, so it is rejected on every other provider
+name rather than accepted and dropped. An enabled tier brings that tier's
+hooks — see
+[claude-agent-sdk: skills and ambient settings](providers/comparison.md#important-skills-and-ambient-settings).
 
 #### Secrets
 
@@ -339,7 +400,18 @@ conductor run review.yaml                 # connects; spawns no nested runtime
 - Closing the provider does **not** terminate the external runtime — the
   SDK only shuts down runtimes it spawned itself, so the orchestrator-owned
   server keeps running. The orchestrator is also responsible for runtime
-  health checks and restarts.
+  health checks and restarts: a **lost connection** to an external runtime
+  (a `BrokenPipeError` or `ConnectionResetError` at the SDK boundary) fails
+  the affected agent immediately (`is_retryable=false`) and is never
+  retried or respawned by Conductor. This differs from the default spawned
+  runtime, which Conductor restarts automatically after a detected crash
+  (a dead child process, or a `BrokenPipeError`/`ConnectionResetError` at
+  the SDK boundary) and retries against, up to a fixed cap of 2 consecutive
+  restarts without an intervening successful call (not configurable via
+  YAML or an environment variable). Note this covers a *lost* connection
+  only; a *failed initial connect* to an external runtime (e.g. it is not
+  reachable at all) is not classified by this mechanism and surfaces as a
+  generic SDK error instead.
 - Runtime-spawn-only options (custom CLI path, injected env, etc.) do not
   apply when connecting to an existing runtime.
 
@@ -399,12 +471,12 @@ Maximum OUTPUT tokens per response:
 ```yaml
 workflow:
   runtime:
-    max_tokens: 4096  # Required for Claude
+    max_tokens: 4096  # Optional: defaults to 16384 when unset
 ```
 
 **Limits**:
 - Haiku: 4096 max
-- Sonnet/Opus: 8192 max
+- Sonnet/Opus: Conductor defaults `max_tokens` to 16384 when unset and does not clamp the configured value to the model's advertised cap — a value above the model limit is rejected by the API. The provider-advertised `ModelInfo.max_tokens` is used only to size the compaction output reserve.
 
 **Note**: This is output tokens, not context window (200K separate limit)
 
@@ -459,16 +531,9 @@ agents (none of which call a model).
   | `xhigh`  | 32 768        |
   | `max`    | 59 904        |
 
-  `max` is pinned to `64000 − 4096` — the largest budget that still leaves the
-  default answer headroom under the 64000-token extended-thinking output cap
-  (at `max`, `max_tokens` lands exactly on the cap).
+  The `max` budget is pinned to `64000 - 4096`, which is the largest budget that still leaves the default answer headroom under the 64000-token cap (at `max`, `max_tokens` lands exactly on the cap).
 
-  Extended thinking is only valid on thinking-capable models
-  (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); a
-  `ValidationError` is raised otherwise. The provider also auto-coerces
-  `temperature` to `1.0` (required by the Anthropic API for extended thinking,
-  logged at INFO) and bumps `max_tokens` to fit `budget + 4096`, capped at
-  `64000` (logged at INFO when clamped).
+  Extended thinking is only valid on thinking-capable models, including `claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, and `claude-haiku-4*` formats. A `ValidationError` is raised otherwise. The provider also auto-coerces `temperature` to `1.0` (required by the Anthropic API for extended thinking, logged at INFO) and bumps `max_tokens` to at least `budget + 4096`, capped at `64000` (logged at INFO when clamped). For `low` and `medium` efforts, because the budget plus headroom is below 16384, the default `max_tokens` of 16384 is sent.
 
 Reasoning / thinking content emitted by the model is surfaced via
 `agent_reasoning` events and rendered in the dashboard, JSONL logs, and
@@ -712,6 +777,22 @@ export ANTHROPIC_API_KEY=sk-ant-...
 export CONDUCTOR_LOG_LEVEL=DEBUG  # INFO, DEBUG, WARNING, ERROR
 ```
 
+### OpenTelemetry
+
+Set `OTEL_EXPORTER_OTLP_ENDPOINT` to enable tracing; the OpenTelemetry SDK
+configures itself using standard environment variables. For detailed setup
+instructions, export protocols, and privacy policies, see the
+[OpenTelemetry Tracing guide](telemetry.md).
+
+| Variable | Purpose |
+|----------|---------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint; setting it enables tracing. |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | Export protocol: `grpc` (default), `http/protobuf`, or `http/json` (supported by Copilot CLI). |
+| `OTEL_SERVICE_NAME` | Service name reported to the collector; defaults to `conductor`. |
+| `OTEL_RESOURCE_ATTRIBUTES` | Key-value pairs for resource attributes (e.g. `deployment.environment=testing`). |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | Enables native-span content capture only for `true`, `SPAN_ONLY`, or `SPAN_AND_EVENT`. |
+| `OTEL_SDK_DISABLED` | Set to `true` to disable tracing for the process. |
+
 ## Best Practices
 
 ### Model Selection
@@ -753,7 +834,7 @@ Always set `max_tokens`:
 
 ```yaml
 runtime:
-  max_tokens: 8192
+  max_tokens: 16384
 ```
 
 ### "temperature must be between 0.0 and 1.0" (Claude)
@@ -833,6 +914,16 @@ Retention never deletes:
 - The `.bg.stderr.log` / `.bg.stdout.log` companion files of a retained
   `--web-bg` run's event log — the three artefacts of one run are always
   kept or removed together.
+
+`keep_last` also bounds a run's **terminal record** — the small JSON
+tombstone at `~/.conductor/runs/terminal/<run_id>.json` that lets a
+completed run's outcome still be looked up by `run_id` after its process
+has exited (see [Fleet Manager: Terminal records](fleet.md#terminal-records)).
+A terminal record is pruned or kept in the same sweep pass as its event
+log, matched by `run_id`, so the two never drift apart — a record can't
+outlive the log it points at. A terminal record whose event log has
+already disappeared is bounded separately, by the same `keep_last`,
+newest-first by when its run actually ended.
 
 > **Consequence:** pruning an event log makes that run's history
 > unavailable to `conductor replay` — `replay` reads the JSONL event log

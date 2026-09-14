@@ -75,6 +75,22 @@ conductor run examples/set-step.yaml \
   --input model=claude-haiku-4.5
 ```
 
+## MCP Step Examples
+
+### mcp-step.yaml
+
+Call an MCP server tool directly without an LLM. Demonstrates:
+
+- `type: mcp` step executing a tool on a configured stdio MCP server
+- Passing Jinja2-templated arguments to the tool
+- Capturing the result envelope (`content`, `structured`, `is_error`) in context
+- Routing conditionally on `output.is_error` to handle tool errors
+- Zero LLM tokens spent on tool execution
+
+```bash
+conductor run examples/mcp-step.yaml
+```
+
 ## Human-in-the-Loop Examples
 
 ### design-review.yaml
@@ -152,6 +168,29 @@ conductor run examples/context-tier.yaml \
 
 See [Context Tier](../docs/configuration.md#context-tier) for details. This is a Copilot-only capability.
 
+## OpenTelemetry Tracing
+
+Enable tracing by setting an OTLP endpoint after installing the optional extra. The trace
+contains provider-independent workflow, agent, and tool spans for every
+provider. Native spans from `copilot`, `claude`, and `openai` are nested
+within a single unified trace tree.
+
+```bash
+uv sync --extra telemetry
+export OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4318
+export OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf
+export OTEL_SERVICE_NAME=conductor
+conductor run examples/simple-qa.yaml --input question="What is OpenTelemetry?"
+```
+
+The HTTP protocol is what lets the Copilot CLI emit its native spans; with
+the default gRPC protocol this recipe exports Conductor's orchestration
+spans only.
+
+No prompt or response content is exported by default. See
+[OpenTelemetry Tracing](../docs/configuration.md#opentelemetry-tracing) before
+setting `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`.
+
 ## Output Validation
 
 ### validator.yaml
@@ -168,6 +207,16 @@ conductor run examples/validator.yaml --input diff="$(git diff HEAD~1)"
 ```
 
 See [Validator](../docs/workflow-syntax.md#validator) for the full field reference and behavior notes.
+
+## Context Compaction
+
+### compaction.yaml
+
+Demonstrates automatic, client-side context compaction for `claude` and `openai` providers. A single research agent runs a long sequence of web searches through an MCP server; the large tool results accumulate in the message history within that one execution, and once the history crosses the calculated trigger threshold, older tool results and messages are compacted. (Loop-back iterations would not demonstrate this — provider history starts fresh on each execution.)
+
+```bash
+conductor run examples/compaction.yaml --input topic="vector databases"
+```
 
 ## Multi-Agent Workflows
 
@@ -271,6 +320,19 @@ Demonstrates:
 
 ```bash
 conductor run examples/script-step.yaml
+```
+
+### mcp-step.yaml
+
+Direct MCP step with tool execution and `is_error`-based routing. Demonstrates:
+- `type: mcp` agents calling stdio MCP server tools directly
+- Passing Jinja2-templated arguments to the tool
+- Capturing structured content and error flags
+- Routing on `is_error` (`when: "{{ output.is_error }}"`)
+- Passing MCP step output to downstream steps
+
+```bash
+conductor run examples/mcp-step.yaml
 ```
 
 ### script-stdin.yaml

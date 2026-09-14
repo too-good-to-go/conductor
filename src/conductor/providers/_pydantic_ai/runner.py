@@ -12,15 +12,17 @@ detail, not a public API of Conductor.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from pydantic import BaseModel
 from pydantic_ai import Agent
+from pydantic_ai.messages import ModelMessage
 
 from conductor.config.schema import AgentDef, OutputField, ToolOutputConfig
 from conductor.exceptions import ProviderError, ValidationError
 from conductor.mcp.manager import MCPManager
+from conductor.providers._pydantic_ai.compaction import CompactionConfig
 from conductor.providers._pydantic_ai.retry import (
     RetryConfig as PydanticRetryConfig,
 )
@@ -79,6 +81,8 @@ async def run_agent_pipeline(
     default_model: str,
     retry_history: list[dict[str, Any]],
     build_agent_fn: Callable[..., Agent[Any, Any]],
+    message_history: Sequence[ModelMessage] | None = None,
+    compaction: CompactionConfig | None = None,
 ) -> AgentOutput:
     """Run the shared Pydantic AI execution pipeline.
 
@@ -109,8 +113,11 @@ async def run_agent_pipeline(
             resolved from the Pydantic AI agent instance.
         retry_history: Mutable list that receives ``agent_retry`` events.
         build_agent_fn: Callable that accepts ``toolsets`` and keyword args
-            (currently ``max_parse_recovery_attempts``) and returns a configured
-            Pydantic AI ``Agent``.
+            (``max_parse_recovery_attempts`` and ``compaction``) and returns a
+            configured Pydantic AI ``Agent``.
+        compaction: Optional resolved compaction config to pass through to
+            ``build_agent_fn``.
+        message_history: Optional messages from a completed Pydantic AI run.
 
     Returns:
         Normalized ``AgentOutput``.
@@ -132,6 +139,12 @@ async def run_agent_pipeline(
     from conductor.providers._pydantic_ai.structured_output import extract_content
     from conductor.providers._pydantic_ai.usage import build_agent_output
 
+    def intercepting_callback(event_type: str, data: dict[str, Any]) -> None:
+        if event_type == "agent_retry":
+            retry_history.append(data)
+        if event_callback is not None:
+            event_callback(event_type, data)
+
     toolsets: list[Any] = []
     if mcp_manager is not None:
         tool_names = None if agent.tools is None and not tools else tools
@@ -149,13 +162,8 @@ async def run_agent_pipeline(
     pydantic_agent = build_agent_fn(
         toolsets,
         max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
+        compaction=compaction,
     )
-
-    def intercepting_callback(event_type: str, data: dict[str, Any]) -> None:
-        if event_type == "agent_retry":
-            retry_history.append(data)
-        if event_callback is not None:
-            event_callback(event_type, data)
 
     outcome = await execute_with_retry(
         coro_factory=lambda: run_with_interrupt(
@@ -167,6 +175,7 @@ async def run_agent_pipeline(
             usage_limits=UsageLimits(request_limit=max_agent_iterations),
             max_session_seconds=max_session_seconds,
             max_parse_recovery_attempts=retry_cfg.max_parse_recovery_attempts,
+            message_history=message_history,
         ),
         retry_config=retry_cfg,
         event_callback=intercepting_callback,
@@ -210,4 +219,5 @@ async def run_agent_pipeline(
         usage=outcome.result.usage,
         model=model_name,
         last_call_input_tokens=outcome.last_call_input_tokens,
+        continuation_state=outcome.result.all_messages(),
     )

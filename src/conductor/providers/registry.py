@@ -6,6 +6,7 @@ provider instances with lazy instantiation and caching.
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING, Any
 
 from conductor.config.schema import ProviderName
@@ -13,7 +14,7 @@ from conductor.providers.base import AgentProvider
 from conductor.providers.factory import create_provider
 
 if TYPE_CHECKING:
-    from conductor.config.schema import AgentDef, WorkflowConfig
+    from conductor.config.schema import AgentDef, ProviderSettings, WorkflowConfig
 
 
 ProviderType = ProviderName
@@ -35,6 +36,8 @@ class ProviderRegistry:
     Key behaviors:
     - **Lazy creation**: Providers created on first agent that needs them
     - **Caching**: Same provider type reused across agents
+    - **Serialized creation**: Concurrent agents resolving one provider type
+      share a single instance; cached reads are lock-free
     - **Lifecycle management**: Closes all providers at workflow end
     """
 
@@ -52,6 +55,17 @@ class ProviderRegistry:
         self._config = config
         self._mcp_servers = mcp_servers
         self._providers: dict[ProviderType, AgentProvider] = {}
+        # Serializes provider *creation* only. Without it,
+        # ``_get_or_create_provider`` is a check-then-act with an ``await``
+        # between the cache check and the cache write, so two agents
+        # resolving one type concurrently could each construct an instance
+        # and the second write replace the first — leaving them holding
+        # different objects for the same provider type. One lock for all
+        # types rather than one per type: creation happens a handful of
+        # times per run, so serializing across types costs nothing
+        # measurable and one lock is simpler to reason about. Cached reads
+        # never take it.
+        self._provider_lock = asyncio.Lock()
         self._default_provider_type: ProviderType = config.workflow.runtime.provider.name
         self._resume_session_ids: dict[str, str] = {}
         self._resume_session_cwds: dict[str, str] = {}
@@ -61,7 +75,7 @@ class ProviderRegistry:
         """Get the default provider type from workflow config."""
         return self._default_provider_type
 
-    def _get_provider_type_for_agent(self, agent: AgentDef) -> ProviderType:
+    def provider_type_for(self, agent: AgentDef) -> ProviderType:
         """Determine which provider type an agent should use.
 
         Args:
@@ -90,7 +104,7 @@ class ProviderRegistry:
         Raises:
             ProviderError: If provider creation fails.
         """
-        provider_type = self._get_provider_type_for_agent(agent)
+        provider_type = self.provider_type_for(agent)
         return await self._get_or_create_provider(provider_type)
 
     async def _get_or_create_provider(self, provider_type: ProviderType) -> AgentProvider:
@@ -105,39 +119,68 @@ class ProviderRegistry:
         Raises:
             ProviderError: If provider creation fails.
         """
-        if provider_type in self._providers:
-            return self._providers[provider_type]
+        # Lock-free fast path: an already-created provider needs no
+        # serialization, so the steady state never contends.
+        cached = self._providers.get(provider_type)
+        if cached is not None:
+            return cached
 
-        # Create the provider with runtime config
-        runtime = self._config.workflow.runtime
-        # Only forward structured provider settings to the matching
-        # provider — settings for Copilot must not bleed into a per-agent
-        # Claude override (and vice versa once Claude grows its own
-        # structured config).
-        provider_settings = runtime.provider if runtime.provider.name == provider_type else None
-        provider = await create_provider(
-            provider_type=provider_type,
-            validate=True,
-            mcp_servers=self._mcp_servers,
-            default_model=runtime.default_model,
-            temperature=runtime.temperature,
-            max_tokens=runtime.max_tokens,
-            timeout=runtime.timeout,
-            max_session_seconds=runtime.max_session_seconds,
-            max_agent_iterations=runtime.max_agent_iterations,
-            default_reasoning_effort=runtime.default_reasoning_effort,
-            provider_settings=provider_settings,
-            tool_output=runtime.tool_output,
-        )
+        async with self._provider_lock:
+            # Re-check inside the lock: a caller that waited while another
+            # was constructing must reuse that instance, not build a second.
+            cached = self._providers.get(provider_type)
+            if cached is not None:
+                return cached
 
-        # Pass stored resume session IDs to newly created providers
-        if self._resume_session_ids and hasattr(provider, "set_resume_session_ids"):
-            provider.set_resume_session_ids(self._resume_session_ids)  # type: ignore[union-attr]
-        if self._resume_session_cwds and hasattr(provider, "set_resume_session_cwds"):
-            provider.set_resume_session_cwds(self._resume_session_cwds)  # type: ignore[union-attr]
+            # Construction, resume-session wiring and the cache write all
+            # happen under the lock, so no waiter can observe a provider
+            # before its restored state is applied. A failure propagates
+            # unchanged and caches nothing, leaving a retry free to proceed.
+            runtime = self._config.workflow.runtime
+            # Only forward structured provider settings to the matching
+            # provider — settings for Copilot must not bleed into a per-agent
+            # Claude override (and vice versa once Claude grows its own
+            # structured config).
+            provider_settings = runtime.provider if runtime.provider.name == provider_type else None
+            provider = await create_provider(
+                provider_type=provider_type,
+                validate=True,
+                mcp_servers=self._mcp_servers,
+                default_model=runtime.default_model,
+                temperature=runtime.temperature,
+                max_tokens=runtime.max_tokens,
+                timeout=runtime.timeout,
+                max_session_seconds=runtime.max_session_seconds,
+                max_agent_iterations=runtime.max_agent_iterations,
+                idle_timeout_seconds=runtime.idle_timeout_seconds,
+                max_idle_recovery_attempts=runtime.max_idle_recovery_attempts,
+                default_reasoning_effort=runtime.default_reasoning_effort,
+                provider_settings=provider_settings,
+                tool_output=runtime.tool_output,
+            )
 
-        self._providers[provider_type] = provider
-        return provider
+            # Pass stored resume session IDs to newly created providers
+            if self._resume_session_ids and hasattr(provider, "set_resume_session_ids"):
+                provider.set_resume_session_ids(self._resume_session_ids)  # type: ignore[union-attr]
+            if self._resume_session_cwds and hasattr(provider, "set_resume_session_cwds"):
+                provider.set_resume_session_cwds(self._resume_session_cwds)  # type: ignore[union-attr]
+
+            self._providers[provider_type] = provider
+            return provider
+
+    def provider_settings_for(self, provider_type: ProviderType) -> ProviderSettings | None:
+        """Return the structured settings this registry constructs a provider with.
+
+        Sub-workflow engines share this registry, so the answer reflects the
+        root configuration that actually built the provider instance — not
+        the child workflow's own ``runtime.provider``, which may carry no
+        connection settings at all (e.g. an inherited external Copilot
+        ``runtime_url``). Mirrors the matching-name rule in
+        ``_get_or_create_provider``: settings apply only to the provider they
+        name.
+        """
+        provider = self._config.workflow.runtime.provider
+        return provider if provider.name == provider_type else None
 
     async def close(self) -> None:
         """Close all provider instances.

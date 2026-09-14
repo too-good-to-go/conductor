@@ -21,6 +21,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **Sub-workflow composition** - Reusable sub-workflows with templated `input_mapping`, usable inside `for_each` groups for dynamic fan-out
 - **Script steps** - Run shell commands and route on exit code or parsed JSON stdout
 - **Set steps** - Bind one or more Jinja2-evaluated values into the context (no LLM, no subprocess) for derived flags, computed defaults, and constants reused by many later prompts
+- **MCP steps** - Call MCP server tools directly without an LLM (deterministic execution, zero prompt tokens, and structured envelope routing)
 - **Terminate steps** - Explicit terminal step with `status` (`success`/`failed`) and structured `reason` — distinguishable from the default `$end` path in CLI exit codes, dashboard state, and event logs
 - **Dialog mode** - Agents can pause for multi-turn conversation when uncertain
 - **Reasoning effort** - Unified `reasoning.effort` (low/medium/high/xhigh/max) per agent or workflow-wide, translated to each provider's native API
@@ -31,6 +32,7 @@ Conductor makes multi-agent workflows — code review pipelines, research-then-s
 - **[Web dashboard](#web-dashboard)** - Real-time workflow visualization with interactive DAG graph, breadcrumb navigation into sub-workflows, live streaming, and in-browser human gates
 - **[Fleet Manager](#fleet-manager-tui)** - An interactive TUI over every running `conductor` process (foreground, `--web`, or `--web-bg`): live status, tokens and cost, gate alerts you can answer, step-level drill-down, and launching new runs — plus non-interactive `conductor stop` / `conductor fleet list`
 - **Validation** - Catches stale template references, missing inputs, and undeclared dependencies before runtime
+- **OpenTelemetry tracing**: Export detailed workflow execution traces to OTLP collectors, such as Jaeger or Tempo, with native Pydantic AI and Copilot CLI span correlation.
 
 
 ## Prerequisites
@@ -562,6 +564,7 @@ See the [`examples/`](./examples/) directory for complete workflows:
 | [design-review.yaml](./examples/design-review.yaml) | Human gate with loop pattern |
 | [script-step.yaml](./examples/script-step.yaml) | Script step with exit_code routing |
 | [set-step.yaml](./examples/set-step.yaml) | Set step deriving named values + boolean-routed branching |
+| [mcp-step.yaml](./examples/mcp-step.yaml) | Direct MCP tool execution with structured routing and error handling |
 | [wait-step.yaml](./examples/wait-step.yaml) | Wait step + script for a polling loop-back pattern |
 | [wait-smoke.yaml](./examples/wait-smoke.yaml) | Minimal wait-only smoke test (no provider required) |
 | [terminate.yaml](./examples/terminate.yaml) | Explicit `type: terminate` with success and failure paths |

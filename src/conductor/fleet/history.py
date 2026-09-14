@@ -33,15 +33,15 @@ no pagination.
 
 from __future__ import annotations
 
-import json
 import logging
-import math
 import re
 from collections.abc import Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Literal
 
+from conductor.fleet import summary
+from conductor.fleet.records import read_terminal_record
 from conductor.fleet.retention import event_log_root
 from conductor.run_id import RUN_ID_PATTERN_SOURCE
 
@@ -110,11 +110,15 @@ class HistoryEntry:
     to still be alive (see the module docstring)."""
 
     started_at: float | None
-    """Unix timestamp of the ``workflow_started`` event, or ``None`` if
-    the log has no such event at all (an unrecognized/garbled file, or
-    one that hasn't recorded it yet) -- the full log is always read
-    (:func:`_read_full_log`), so this is never unknown merely because
-    the event was far from the end of the file."""
+    """Unix timestamp of the **latest** ``workflow_started`` event, or
+    ``None`` if the log has no such event at all (an unrecognized/garbled
+    file, or one that hasn't recorded it yet) -- the full log is always
+    read (:func:`_read_full_log`), so this is never unknown merely because
+    the event was far from the end of the file. On a resumed run this is
+    the current attempt's start time, not the original one (issue #485,
+    Q2): since this field isn't itself a displayed column, the effect is
+    on :attr:`duration_seconds`'s fallback, which stops spanning the idle
+    gap between a resume's generations."""
 
     ended_at: float | None
     """Unix timestamp of the terminal event, or ``None`` if there is none."""
@@ -139,6 +143,26 @@ class HistoryEntry:
     data -- mirrors ``RunSummary.unpriced_agent_count`` / issue #265's
     convention rather than silently summing a null into a confident total."""
 
+    output: dict[str, Any] = field(default_factory=dict)
+    """The run's rendered ``output:`` dict, enriched from a matching
+    :class:`~conductor.fleet.records.TerminalRunRecord` (E4-T4) --
+    ``{}`` when there is no matching terminal record (``run_id`` is
+    ``None``, a pre-upgrade run, or the record has already been pruned).
+    This is an **enrichment joined onto** the log-derived entry above,
+    never a replacement for it -- see the module docstring's ``outcome``
+    vs. terminal-record distinction; ``outcome`` continues to come from
+    the event log alone."""
+
+    error_type: str | None = None
+    """The failing run's exception class name, enriched from the matching
+    terminal record; ``None`` when the run succeeded or no terminal
+    record is available."""
+
+    error_message: str | None = None
+    """The failing run's exception message, enriched from the matching
+    terminal record; ``None`` when the run succeeded or no terminal
+    record is available."""
+
     @property
     def has_unpriced(self) -> bool:
         """``True`` when at least one completed agent had no cost data."""
@@ -162,18 +186,13 @@ def _parse_filename(path: Path) -> tuple[str, str | None]:
 def _finite_float(value: Any) -> float | None:
     """Return ``value`` as a ``float`` iff it is a finite ``int``/``float``.
 
-    ``NaN``/``Infinity``/``-Infinity`` are valid JSON values (Python's
-    ``json`` module accepts them by default) but are not legitimate
-    timestamps, durations, token counts, or costs -- letting one through
-    would silently poison a sum or crash the History screen's duration
-    formatting (``int(nan)``/``int(inf)`` both raise) downstream (E14
-    review round 1). Rejected the same way a wrong-shaped value already
-    is: silently ignored, not raised.
+    Delegates to :func:`conductor.fleet.summary._finite_float`, which
+    enforces the identical rule (``NaN``/``Infinity`` are valid JSON but
+    not legitimate timestamps/durations/token counts/costs) over the same
+    engine-written event payloads -- hosted there since this module
+    already imports :mod:`conductor.fleet.summary`.
     """
-    if not isinstance(value, int | float):
-        return None
-    value = float(value)
-    return value if math.isfinite(value) else None
+    return summary._finite_float(value)
 
 
 @dataclass
@@ -204,18 +223,26 @@ def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
     :func:`_read_full_log` stream rather than materialise a list. A
     future edit must not break this by, say, iterating ``events`` twice.
 
-    A **resumed** run appends a fresh ``workflow_started`` after an
-    earlier terminal event without a dashboard attached (the engine only
-    suppresses that re-emit when seeding a dashboard on resume --
-    ``cli/run.py``), so a log can legitimately contain
-    ``workflow_started`` -> ... -> ``workflow_failed`` -> a *second*
-    ``workflow_started`` -> more activity. Any ``workflow_started`` past
-    the first is therefore treated as the start of a new root execution
-    generation: the previously recorded terminal ``outcome``/``ended_at``/
+    A **resumed** run always appends a fresh ``workflow_started`` after an
+    earlier terminal event, whether or not a dashboard is attached --
+    ``cli/run.py`` suppresses only the *engine's own re-emit* (so a live
+    dashboard does not double-count nested-workflow depth), then writes
+    the same payload directly to the event-log subscriber, bypassing the
+    emitter, so the persisted JSONL always records the generation boundary
+    either way. So a log can legitimately contain ``workflow_started`` ->
+    ... -> ``workflow_failed`` -> a *second* ``workflow_started`` -> more
+    activity. Any ``workflow_started`` past the first is therefore treated
+    as the start of a new root execution generation: the previously
+    recorded terminal ``outcome``/``ended_at``/
     ``reported_elapsed`` are reset back to their "no terminal event yet"
     defaults, so an in-progress resumed attempt reads as ``"unknown"``
     (never the stale prior attempt's outcome) until *its own* terminal
-    event is seen (E14 review round 1).
+    event is seen (E14 review round 1). ``started_at`` is likewise taken
+    from the **latest** ``workflow_started`` (issue #485, Q2): a resumed
+    run's :attr:`HistoryEntry.duration_seconds` fallback (``ended_at -
+    started_at``, used when no engine-reported ``elapsed`` is available --
+    e.g. a resumed-then-failed run) should measure the current attempt,
+    not span the idle gap since the very first one.
     """
     result = _ScanResult()
     seen_workflow_started = False
@@ -243,8 +270,8 @@ def _scan_history_events(events: Iterable[dict[str, Any]]) -> _ScanResult:
                 result.reported_elapsed = None
             else:
                 seen_workflow_started = True
-                if ts is not None:
-                    result.started_at = ts
+            if ts is not None:
+                result.started_at = ts
 
         elif etype == "workflow_completed":
             result.outcome = "completed"
@@ -289,89 +316,71 @@ def _read_full_log(path: Path) -> Iterator[dict[str, Any]]:
     """Stream-parse every line of a retained event log, oldest first,
     yielding one parsed event dict at a time.
 
-    Unlike ``fleet.summary``'s bounded tail/head readers -- built for a
-    *live* run's cheap, repeated ~2s poll, or a bounded detail view --
-    History only ever reads a log once, after the run is already done, so
-    there is no reason to accept a bounded reader's truncation trade-off
-    here. A byte-capped read can silently omit an early token/cost event
-    or discard an oversized terminal event that falls outside the window,
-    presenting a genuinely completed run as ``"unknown"`` with an
-    incomplete total (E14 review round 1). This function is a generator:
-    neither the raw bytes nor the parsed events are ever fully
-    materialised into a list, so memory is proportional to the largest
-    single line, not to the log's size (retained state beyond that one
-    line/dict is just two booleans). Contrast
-    ``conductor.fleet.summary.read_event_log_full``, which caps its read
-    at 8 MiB and therefore trades coverage for a bounded (but nonzero)
-    memory footprint; streaming gives History unbounded coverage and
-    bounds memory against event *count*, so it needs no equivalent
-    count-based cap -- but a single oversized line is still read and
-    parsed whole (``for raw_line in f`` reads up to the next newline), so
-    this is not an unconditional memory bound. The two readers' differing
-    bounds are a deliberate consequence of their differing consumers (a
-    live-run detail view vs. a done-run, read-once history), not an
-    oversight.
+    Delegates the actual line-reading and JSON-parsing to
+    :func:`conductor.fleet.summary.stream_event_log` (issue #485), which
+    made this exact choice -- an uncapped, streamed read bounded by the
+    longest single line rather than by file size or event count -- for
+    History first and generalized it for the Runs/run-detail screens'
+    former bounded tail/head/full-log readers to share. History still
+    reads a log once, after the run is already done, so there is no
+    reason to accept a bounded reader's truncation trade-off: a byte-capped
+    read can silently omit an early token/cost event or discard an
+    oversized terminal event outside its window, presenting a genuinely
+    completed run as ``"unknown"`` with an incomplete total (E14 review
+    round 1).
 
-    The generator holds the file handle open (inside its ``with``) until
-    it is exhausted, closed, or garbage collected -- that ``with`` block,
-    not any particular caller, owns the handle's lifetime. The sole
-    consumer in production, :func:`_build_entry`, drains it to completion
-    via :func:`_scan_history_events`; tests may consume it directly and
-    abandon it early, which is exactly why the handle's release does not
-    depend on caller behavior.
+    The generator holds the file handle open (inside ``stream_event_log``'s
+    own ``with``) until it is exhausted, closed, or garbage collected --
+    that ``with`` block, not any particular caller, owns the handle's
+    lifetime. The sole consumer in production, :func:`_build_entry`, drains
+    it to completion via :func:`_scan_history_events`; tests may consume it
+    directly and abandon it early, which is exactly why the handle's
+    release does not depend on caller behavior.
 
     Because this is a generator, none of its side effects happen when
     ``_read_full_log(path)`` is called -- they happen while the returned
-    iterator is being **consumed**. In particular, ``open()`` and any
-    ``OSError`` it raises (permission denied, the file vanishing
-    mid-scan, or any other read failure) surface on the first
-    ``next()``, not at call time. Unlike ``read_event_log_tail``'s
-    never-raise contract, such a failure is deliberately **not**
-    swallowed: it propagates so :func:`build_history_entries`'s
-    per-file guard can tell "genuinely no events" apart from "couldn't
-    read this file at all" and skip the latter, rather than presenting a
-    fabricated ``"unknown"`` entry for a log it never actually read
-    (E14-T4 / E14 review round 1).
+    iterator is being **consumed**. In particular, ``open()`` (and any
+    ``OSError`` it raises: permission denied, the file vanishing mid-scan,
+    or any other read failure) surfaces on the first ``next()``, not at
+    call time -- the delegated-to ``stream_event_log`` is always the
+    *first* thing this generator's body does, before any size check, so a
+    failure opening the file is never masked by an empty-file fast path.
+    Unlike ``fleet.summary``'s former bounded readers' never-raise
+    contract, such a failure is deliberately **not** swallowed: it
+    propagates so :func:`build_history_entries`'s per-file guard can tell
+    "genuinely no events" apart from "couldn't read this file at all" and
+    skip the latter, rather than presenting a fabricated ``"unknown"``
+    entry for a log it never actually read (E14-T4 / E14 review round 1).
 
     A malformed individual line (bad JSON, a truncated write caught
-    mid-flush) is tolerated the same way the bounded readers already do
-    -- skipped rather than aborting the whole read, with a single
-    aggregate warning logged if any lines were skipped (partial
-    corruption still produces an entry, but not silently). But a
-    **non-empty** file (at least one non-blank line) that yields **zero**
-    parseable events is corrupt, not "legitimately empty" -- E14-T4
-    requires a corrupt log to be skipped, not shown as an ordinary
-    ``"unknown"`` entry (E14 review round 2). Raises
-    :class:`_CorruptEventLogError` in that case, once the stream is
-    exhausted; a genuinely empty file (no non-blank lines at all) still
-    yields nothing and raises nothing, which :func:`_build_entry`
-    legitimately turns into an ``"unknown"`` entry.
+    mid-flush) is tolerated by the shared reader the same way it always
+    has been here -- skipped rather than aborting the whole read. But a
+    **non-empty** file that yields **zero** parseable events is corrupt,
+    not "legitimately empty" -- E14-T4 requires a corrupt log to be
+    skipped, not shown as an ordinary ``"unknown"`` entry (E14 review
+    round 2). Raises :class:`_CorruptEventLogError` in that case, once the
+    stream is exhausted; a genuinely empty (zero-byte) file still yields
+    nothing and raises nothing, which :func:`_build_entry` legitimately
+    turns into an ``"unknown"`` entry. Distinguishing the two now checks
+    ``path.stat().st_size`` **after** the read completes with nothing
+    yielded (rather than "at least one non-blank raw line", this
+    function's own former signal) -- deliberately after, not before,
+    because checking size first would let a permission error on a
+    zero-byte file skip the read (and the ``OSError`` it should raise)
+    entirely. The shared reader has no reason to track skipped-line
+    counts for a live run's cheap, repeated poll, so this function no
+    longer can either. A file containing only blank/whitespace lines --
+    untested, and not known to occur in practice, since every write here
+    is a single JSON object per line -- would now read as "corrupt" rather
+    than "empty"; a zero-byte file (the only shape a genuinely fresh or
+    truncated-at-creation log actually takes) is unaffected.
     """
-    saw_nonblank_line = False
     yielded_any = False
-    skipped_lines = 0
-    with open(path, "rb") as f:
-        for raw_line in f:
-            line = raw_line.strip()
-            if not line:
-                continue
-            saw_nonblank_line = True
-            try:
-                obj = json.loads(line.decode("utf-8"))
-            except (UnicodeDecodeError, ValueError, RecursionError):
-                skipped_lines += 1
-                continue
-            if isinstance(obj, dict):
-                yielded_any = True
-                yield obj
-    if saw_nonblank_line and not yielded_any:
+    for evt in summary.stream_event_log(path):
+        yielded_any = True
+        yield evt
+    if not yielded_any and path.stat().st_size > 0:
         raise _CorruptEventLogError(f"{path}: non-empty log with no parseable events")
-    if skipped_lines:
-        logger.warning(
-            "%s: skipped %d unparseable line(s); this run's totals may be incomplete",
-            path,
-            skipped_lines,
-        )
 
 
 def _build_entry(path: Path) -> HistoryEntry:
@@ -448,6 +457,52 @@ def _resolve_keep_last() -> int:
         return _DEFAULT_KEEP_LAST
 
 
+def _enrich_with_terminal_record(entry: HistoryEntry) -> HistoryEntry:
+    """Join a matching :class:`~conductor.fleet.records.TerminalRunRecord`
+    onto ``entry`` (E4-T4).
+
+    An **enrichment joined onto** the log-derived entry, not a replacement
+    for it (see the module docstring's DD1 grounding): only `output`/
+    `error_type`/`error_message` are added here, and `entry.outcome`
+    (derived from the event log alone, by :func:`_scan_history_events`)
+    is left untouched. Called after :func:`_build_entry` has already
+    completed its single-pass scan, so this never re-reads or re-scans
+    the log itself -- issue #436's single-forward-pass constraint on
+    `_scan_history_events` is unaffected.
+
+    Args:
+        entry: A `HistoryEntry` already built from a full log scan.
+
+    Returns:
+        `entry` unchanged when `entry.run_id` is `None` (an unrecognized
+        filename), when no terminal record exists for it (a pre-upgrade
+        run, a crash before one was ever written, or one already pruned
+        by `fleet.retention`), or when reading the record fails for any
+        reason -- enrichment must never turn a displayable row into a
+        dropped one, so any failure here is swallowed and logged rather
+        than propagated.
+    """
+    if entry.run_id is None:
+        return entry
+    try:
+        record = read_terminal_record(entry.run_id)
+    except Exception:
+        logger.warning(
+            "Failed to read terminal record for run_id=%s; history row unenriched",
+            entry.run_id,
+            exc_info=True,
+        )
+        return entry
+    if record is None:
+        return entry
+    return replace(
+        entry,
+        output=record.output,
+        error_type=record.error_type,
+        error_message=record.error_message,
+    )
+
+
 def build_history_entries(*, keep_last: int | None = None) -> list[HistoryEntry]:
     """Enumerate completed runs from retained event logs (E14-T1).
 
@@ -489,7 +544,7 @@ def build_history_entries(*, keep_last: int | None = None) -> list[HistoryEntry]
     entries: list[HistoryEntry] = []
     for path in candidates:
         try:
-            entries.append(_build_entry(path))
+            entry = _build_entry(path)
         except (OSError, _CorruptEventLogError):
             logger.warning("Skipping unreadable/corrupt event log %s", path, exc_info=True)
             continue
@@ -498,4 +553,5 @@ def build_history_entries(*, keep_last: int | None = None) -> list[HistoryEntry]
                 "Unexpected failure building history entry for %s; skipping", path, exc_info=True
             )
             continue
+        entries.append(_enrich_with_terminal_record(entry))
     return entries

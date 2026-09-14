@@ -13,7 +13,6 @@ This document provides a comprehensive reference for the Conductor workflow YAML
 - [Tools](#tools)
 - [Skills](#skills)
 - [External File References](#external-file-references)
-- [Hooks](#hooks)
 
 ## Workflow Configuration
 
@@ -39,11 +38,6 @@ workflow:
     timeout_seconds: 600            # Optional: Maximum wall-clock time (seconds)
     budget_usd: 5.00                # Optional: Cost cap in USD (no tracking when unset)
     budget_mode: audit              # audit (default) | enforce
-
-  hooks:
-    on_start: "{{ template }}"      # Optional: Expression evaluated on start
-    on_complete: "{{ template }}"   # Optional: Expression evaluated on success
-    on_error: "{{ template }}"      # Optional: Expression evaluated on error
 
   context_mode: accumulate          # accumulate | snapshot | minimal (default: accumulate)
 
@@ -75,6 +69,14 @@ workflow:
                                       # its own `context_tier`.
                                       # See docs/configuration.md#context-tier.
 
+    idle_timeout_seconds: 90          # Optional: seconds without SDK events before a
+                                      # Copilot session is treated as idle (Copilot only).
+                                      # Default: 90. Suppressed entirely while a tool
+                                      # call is in flight.
+    max_idle_recovery_attempts: 5     # Optional: "please continue" prompts sent before
+                                      # failing an idle Copilot session (Copilot only).
+                                      # Default: 5. 0 means fail on first genuine idle.
+
     working_dir: "/path/to/cwd"       # Optional: global default working directory for LLM agents
                                       # and their MCP servers. Relative paths resolve against the
                                       # parent directory of the workflow YAML file.
@@ -100,18 +102,18 @@ agents:
     description: string             # Optional: Purpose description
     type: agent                     # agent | human_gate | questions | script | workflow | wait | terminate (default: agent)
     model: string                   # Optional: Model identifier (e.g., 'claude-sonnet-4.5')
-    
+
     prompt: |                       # Required for type=agent: Agent instructions
       Multi-line prompt with Jinja2 templates
       {{ workflow.input.field }}
       {{ previous_agent.output.field }}
-    
+
     input:                          # Optional: Explicit input declarations
       field_name:
         from: "{{ expression }}"
         type: string                # string | number | boolean | array | object
         required: true
-    
+
     output:                         # Optional: Output schema for validation
       field_name:
         type: string                # string | number | boolean | array | object
@@ -132,7 +134,7 @@ agents:
                                     # envelope: explicit opt-in to structured
                                     #   output pipeline (same as default when
                                     #   output: is declared).
-    
+
     tools:                          # Optional: Agent-specific tools
       - tool_name
 
@@ -400,6 +402,128 @@ Because paths are normalized lexically instead of resolving to their real paths:
 > Setting `working_dir` doesn't restrict the model's filesystem access. The model can still read and write files outside this directory if it uses absolute paths or parent directory traversals (e.g., `../`). Avoid relying on this configuration to sandbox untrusted model execution.
 > On the `claude-agent-sdk` provider the directory is also a trust boundary in the other direction: the `claude` CLI loads `CLAUDE.md` and `.claude/settings*.json` (including hooks) from wherever it runs, so pointing `working_dir` at an untrusted checkout means running that checkout's instructions.
 
+### Target-Repository Skills (`settings_dir`)
+
+`settings_dir` names a second directory whose `.claude/skills` the agent may
+use, and whose tree the model's built-in file tools may read. It carries the
+*skills* third of a Claude Code `project` settings tier and nothing else of it
+— the table below is exact about which — and the filesystem half applies
+whether or not any tier is enabled. It applies only to `claude-agent-sdk` agents.
+Setting it against any other provider is an **error**, reported by `conductor
+validate` and again at run time — not a silently dropped field. The skills half
+additionally requires `runtime.provider.setting_sources` to enable the `project`
+tier; the filesystem grant below applies either way.
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      setting_sources: [project]
+
+agents:
+  - name: judge
+    settings_dir: "{{ setup_worktree.output.worktree_path }}"
+    prompt: Review the change against this repository's conventions.
+```
+
+#### Why it is separate from `working_dir`
+
+An agent's cwd does two unrelated jobs, and on this provider they conflict.
+The `claude` CLI supports the MCP Roots protocol and advertises exactly one
+root — its cwd. A filesystem MCP server therefore **discards the directories
+in its own argv** and permits cwd alone; `--add-dir` takes no part in that
+negotiation, so it cannot widen what a server allows. cwd is simultaneously
+the directory the `project` settings tier resolves against.
+
+So pointing `working_dir` at a target repository to pick up that repository's
+skills also narrows the agent's only MCP root onto it, and any sibling path
+the step still has to read — an artifacts directory, a second checkout — is
+denied. Widening cwd back loses the repository's conventions.
+
+`settings_dir` splits the two. Skills are discovered from cwd **and** from
+`settings_dir`, so cwd can stay wide enough to contain everything the agent
+must read:
+
+```yaml
+agents:
+  - name: judge
+    # No working_dir: cwd stays the launch directory, which contains both the
+    # worktree and the artifacts this judge reads through the filesystem MCP.
+    settings_dir: "{{ setup_worktree.output.worktree_path }}"
+```
+
+#### What it does and does not carry
+
+Measured against the CLI:
+
+| Named via `settings_dir` | Granted? |
+|---|---|
+| **Filesystem access for the model's built-in tools** (`Read`, `Edit`, `Bash`, …) | **yes — unconditionally**, see below |
+| `.claude/skills` | **yes** — listed and invocable |
+| `CLAUDE.md` | no |
+| `.claude/rules/*.md` | no |
+| `.claude/settings.json` `env` | no |
+| `.claude/settings.json` `hooks` | no — measured, see below |
+| `.claude/agents` | no |
+
+> ⚠️ **The filesystem grant does not depend on `setting_sources`.** This field
+> maps to the SDK's `add_dirs`, whose own contract is *"additional directories
+> Claude can access beyond the current working directory"* — so naming a
+> directory here widens the model's built-in file tools to that tree whether or
+> not any settings tier is enabled. Measured against `claude` CLI 2.1.263 at
+> `permission_mode: "default"` with `setting_sources` unset: a read outside
+> cwd is refused without `settings_dir` and succeeds with it. (Later CLI
+> builds no longer accept that mode by name; Conductor never passes it
+> explicitly, so the reproduction needs the version above.) Note an agent that omits `tools:` runs
+> under `bypassPermissions`, where reads already succeed everywhere, so the
+> grant only becomes observable once permissions are in play.
+>
+> Skill discovery is the *reason* to set this field; the filesystem grant is
+> its unavoidable companion. Point it at a directory the agent is entitled to
+> read.
+>
+> `conductor validate` warns when `settings_dir` is set without the `project`
+> tier enabled, and so does the run itself — otherwise the only effect an
+> author would get is the one they did not ask for.
+
+Note this grant is for the model's **built-in** tools only. It does not widen
+what a filesystem MCP server permits — that stays cwd alone, which is the
+whole reason this field exists.
+
+**The `hooks` row is a measured negative.** A `PreToolUse` hook that appends
+to a file (an observable side effect, not a log line) runs when `working_dir`
+is the repository and the `project` tier is enabled, and does **not** run when
+the same repository is reached only through `settings_dir` — with or without a
+tier enabled. The control firing is what makes the negative meaningful.
+
+Setting aside the filesystem grant, this field is the *skills portion* of a
+project tier, not a cwd-independent way to load one. It cuts favourably in one direction —
+a target repository's skills arrive without its hooks also running — but it
+does not compose with `working_dir` into "everything, anywhere":
+
+> An agent that needs a target repository's **rules or instructions** as well
+> as a cwd wide enough for its MCP servers cannot get both from these fields.
+> One directory cannot be narrow and wide at once. `settings_dir` recovers the
+> skills; anything else is a caller-side trade — keep `working_dir` on the
+> repository and arrange for every path the agent reads to sit beneath it.
+
+#### Resolution and restrictions
+
+- Resolved exactly like `working_dir` — Jinja2-rendered, `~`-expanded,
+  relative paths resolved against the workflow file's directory, normalized
+  with `os.path.normpath`, and existence-checked before any provider call.
+- Per-agent only. There is no `runtime.settings_dir`, because the repository
+  whose conventions apply is what varies between steps.
+- Rejected on `wait`, `set`, `terminate`, `script`, `human_gate`, `questions`
+  and `workflow` step types — none has an LLM session to apply a settings tier
+  to, and accepting it silently would suggest conventions had been loaded when
+  none had.
+
+> ⚠️ A settings tier brings everything that tier defines. Enable
+> `setting_sources` and point `settings_dir` only at repositories trusted to
+> the same degree as the workflow itself.
+
 ### Session Continuity (`session_key`)
 
 By default each agent execution starts a fresh provider session, so an agent
@@ -520,7 +644,7 @@ agents:
   - name: approval_gate
     type: human_gate
     description: "Approve the proposed changes"
-    
+
     options:                        # Required: List of choices
       - name: approve
         description: "Approve and proceed"
@@ -528,7 +652,7 @@ agents:
         description: "Request revisions"
       - name: reject
         description: "Reject the proposal"
-    
+
     routes:
       - to: implementer
         when: "{{ approval_gate.choice == 'approve' }}"
@@ -1023,6 +1147,136 @@ Per-key typing on multi `values:` is not supported.
 
 **Events** — set steps emit `set_started` / `set_completed` / `set_failed` (mirroring the script-step lifecycle) in all three positions: linear main loop, parallel group member, and for-each iteration. The `set_completed` payload carries `output_type`, `output_keys` (sorted, empty for scalars), and `value_repr` (a JSON-safe preview, truncated at 512 chars).
 
+### MCP Steps
+
+MCP steps call a tool on a configured MCP server directly without invoking an LLM. There is no model call, no prompt tokens are spent, and execution is deterministic. Use them to fetch files, query databases, invoke APIs, or perform external tool operations where the exact tool and arguments are known in advance.
+
+```yaml
+agents:
+  - name: read_spec
+    type: mcp
+    server: filesystem                      # Server name in runtime.mcp_servers (required, literal)
+    tool: read_file                         # Tool name on the MCP server (required, literal)
+    arguments:                              # Tool arguments (optional, Jinja2-rendered)
+      path: "docs/spec.md"
+    timeout: 30                             # Per-call timeout in seconds (optional)
+    routes:
+      - to: handle_error
+        when: "{{ output.is_error }}"
+      - to: analyze_spec
+```
+
+**Fields:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `server` | `string` | **Required.** MCP server name declared in `workflow.runtime.mcp_servers`. Literal string only; templates are rejected. |
+| `tool` | `string` | **Required.** Tool name as exposed by the server. Literal string only; templates are rejected. |
+| `arguments` | `mapping` | Optional tool arguments dict. Recursively Jinja2-rendered against workflow context. |
+| `timeout` | `integer` | Optional per-call timeout in seconds. Raises `ExecutionError` if exceeded. |
+| `output` | `mapping` | Optional output schema for validating the merged result envelope. |
+| `routes` | `list` | Optional route list evaluated against the merged result envelope. |
+| `input` | `list` | Optional input reference declarations used in explicit context mode. |
+
+**Argument rendering and type coercion:**
+
+Dicts and lists inside `arguments` are walked recursively. String leaves are Jinja2-rendered against the workflow context, and each *fully rendered string* is then parsed as YAML (the `set` step's `auto` rule) — whatever the rendered text parses as becomes the argument value:
+
+- Whole-string scalars: `"105"` -> `int`, `"true"` -> `bool`, `"null"` -> `None`.
+- Collections: `"[1, 2]"` -> `list`, `"key: value"` -> `dict`.
+- Embedded templates are parsed the same way — `"1{{ x }}"` with `x=2` renders `"12"` and becomes the integer `12`, and `"label: {{ x }}"` becomes a mapping. Only renders whose text parses as a plain string (e.g. `"pre-{{ x }}"` -> `"pre-2"`, multi-word prose) stay strings.
+- Empty or whitespace-only renders become `""`; a render that parses as `null` through anything but an explicit null marker (`null`, `~`) keeps its raw string form.
+- Native YAML scalars (integers, floats, booleans, `None`) pass through without change.
+
+If an argument's exact type matters, keep the rendered text unambiguous (e.g. quote it in a way that cannot parse as another type, or build the value in a `set` step where you can assert `output_type`).
+
+**Result envelope and merge rule:**
+
+An MCP tool execution produces a result envelope with three base keys:
+
+```json
+{
+  "content": [
+    {"type": "text", "text": "..."}
+  ],
+  "structured": {"record_id": 42, "status": "ok"},
+  "is_error": false
+}
+```
+
+When the tool returns structured content (a dictionary under `structured`), its top-level keys are merged directly into the agent's output dictionary alongside the envelope. Downstream templates and route conditions can access these fields directly:
+
+```jinja2
+{{ read_spec.output.content }}         # Content blocks list
+{{ read_spec.output.structured }}      # Raw structured dict (or null)
+{{ read_spec.output.is_error }}        # Boolean error flag
+{{ read_spec.output.record_id }}       # Merged structured field
+```
+
+The base keys `content`, `structured`, and `is_error` are reserved by the envelope, and `outputs` / `errors` are additionally reserved because the workflow engine recognizes parallel/for-each group outputs by exactly those two top-level keys — a structured result flattening them would make the step's output indistinguishable from a group output. If the structured dictionary contains colliding keys, the envelope wins, the colliding keys are omitted from the merge with a debug-level log message, and they stay reachable under `output.structured.<key>`.
+
+**`is_error` semantics and routing:**
+
+When an MCP tool reports a logical tool failure (`isError: true` in the MCP protocol), the step sets `output.is_error = True` and completes normally. The workflow engine does not treat this as a workflow crash, allowing you to handle tool failures via routing:
+
+```yaml
+routes:
+  - to: handle_tool_error
+    when: "{{ output.is_error }}"
+  - to: process_success
+```
+
+In contrast, transport failures, unknown server names, unlisted tools, server launch failures, call timeouts, and output schema validation mismatches raise exceptions and fail the step.
+
+**Server transport:**
+
+MCP steps currently support `stdio` servers only. Configuring an `http` or `sse` server for an MCP step is rejected during validation and runtime with an explicit error: `type: mcp supports stdio servers only (http/sse support is not implemented yet)`.
+
+**Concurrency and slot serialization:**
+
+Calls to the same MCP server process are serialized via an internal per-server slot lock to protect the stdio stream. Calls to different MCP servers run in parallel when placed in parallel groups. The engine pools one server process per `(server, working_dir)` pair, bounded by `_MCP_STEP_POOL_MAX` (16) as a *soft* threshold: when the pool is at the cap, the oldest entry not currently serving a call is closed to make room, so a for_each rendering many unique working directories cannot spawn unbounded server processes within a single run. If every entry is busy serving a call, the overflow is allowed rather than blocking or failing the step — the cap bounds idle connections, not in-flight work.
+
+**Timeouts:**
+
+The step-level `timeout` field sets a per-call timeout in seconds for the MCP tool invocation. It is independent of the overall `workflow.limits.timeout_seconds`, which bounds the entire workflow execution.
+
+**Composition:**
+
+- **Parallel groups:** MCP steps can run inside `parallel` groups. Invocations targeting distinct servers execute concurrently; invocations targeting the same server serialize on the server slot lock.
+- **For-each groups:** MCP steps can serve as the inline agent of a `for_each` group.
+- **Working directory:** The server process inherits the workflow's `runtime.working_dir`, rendered dynamically per execution. Step-level `working_dir` is not allowed on MCP steps.
+
+**Validation rules:**
+
+- **Static validation (`conductor validate`):** Validates workflows offline without connecting to servers. Checks that the referenced server is declared in `runtime.mcp_servers`, has `type: stdio`, allows the tool in its `tools:` filter (a `"*"` member means unrestricted), that every Jinja template in `arguments` parses, and that no template references a sibling member of the same parallel group.
+- **Runtime validation (`conductor run`):** Repeats the *target* checks at execution time — the server is declared, the transport is stdio, the tool is allowlisted, and (only possible live) the tool actually exists on the connected server. Runtime does **not** repeat the offline-only diagnostics: template syntax checking and same-parallel-group reference analysis run exclusively under `conductor validate`, so skipping validation forfeits those two guarantees.
+
+**Limits and truncation policy:**
+
+`runtime.tool_output` bounds the total text length across all text blocks in `content`. When text output exceeds `max_chars`, blocks are truncated in order. Truncated blocks receive `"truncated": true` and a `"spill_path"` pointing to the full spilled output file when spilling is enabled. The `structured` dictionary represents structured application data and is never truncated.
+
+**Events, errors, and secrets policy:**
+
+MCP steps emit three lifecycle events:
+- `mcp_started`: contains `agent_name`, `iteration`, `server`, `tool`, and `argument_keys` (sorted list of key names only).
+- `mcp_completed`: contains `agent_name`, `elapsed`, `server`, `tool`, `is_error`, `result_bytes`, `truncated`, and optional `spill_path` (only ever a Conductor-generated spill file path — server-supplied `truncated`/`spill_path` block fields are stripped at ingestion and never forwarded; on a resumed run the synthetic replay does not republish markers stored in a checkpoint at all, since a checkpoint written before the stripping existed can carry server-supplied ones).
+- `mcp_failed`: contains `agent_name`, `elapsed`, `server`, `tool`, `error_type`, and a `message` that is either authored and value-free (unknown server, non-stdio transport, disallowed/missing tool, a timeout with its duration) or a generic redacted pointer (see below).
+
+**Argument values and result payloads are never included in MCP step event payloads** — this guarantee covers exactly the tool arguments and the tool result bodies, nothing else. Two things stay visible *by design*, so plan around them:
+
+- `for_each` item identifiers: the `key_by` value of each item is copied onto that item's `mcp_*` events as `item_key`. Do not use a sensitive value as `key_by` (e.g. a token that is also a tool argument) — it will appear in event streams and the dashboard.
+- Anything you *explicitly* surface: writing an MCP result into the workflow's final `output:` publishes it in `workflow_completed`, and referencing it in a later step's `prompt`/`arguments` sends it onward. The redaction governs automatic event metadata, not data you route yourself.
+
+When a call fails with anything but an authored value-free error, the step's raw exception (which can embed argument or result values) is written only to a private per-run diagnostic file — `*.mcp-diagnostics.log` next to the run's `*.events.jsonl` log — and the `mcp_failed` event plus the raised error point at that path. The redaction extends downstream: the step re-raises a generic error, so `workflow_failed` and group failure events (`parallel_agent_failed`, `for_each_item_failed`) also carry only the sanitized message. The diagnostic file may contain secrets; it is not deleted automatically and is covered by the same temp-directory hygiene as `runtime.tool_output` spill files.
+
+**Cancellation and interrupt semantics:**
+
+MCP steps do not support automatic retries (`retry:` is forbidden). A dashboard **Stop** (or Esc in the terminal) during a main-loop MCP step cancels the in-flight call — across the slot wait, the lazy connect, and the call itself — and enters the usual pause flow (`agent_paused`, then Resume/Kill). A cancelled call is never replayed transparently: its external side effects are unknown, so the step is re-entered from the top only on an *explicit* resume decision — a dashboard **Resume**/guidance, or the terminal interrupt menu. If the pause resolves without anyone making that decision (every browser client disconnects mid-pause, or the dashboard has no connected clients at all), the run stops as a resumable failure flagged `stopped_by_user` with a checkpoint, and `conductor resume` becomes the explicit re-execution boundary — unlike LLM agents, which auto-resume on disconnect because re-running one only costs tokens. **Kill** unwinds the workflow. Within parallel and for-each groups, MCP members behave like LLM members: a Stop reaches them through the group's cancellation/drain, not through a mid-call interrupt signal. When a run is cancelled or the workflow-level `limits.timeout_seconds` fires, the engine stops waiting for the call. Any external side effects already performed by the MCP server process are not rolled back, providing at-least-once execution semantics on workflow resume.
+
+**Restrictions:**
+
+MCP steps cannot have `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `settings_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
+
 ### Sub-Workflow Steps
 
 Sub-workflow steps reference external workflow YAML files, enabling composable and reusable workflow building blocks. The sub-workflow runs as a black box — its internal agents are not visible to the parent.
@@ -1161,7 +1415,7 @@ agents:
 
 **Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `max_depth`, `retry`, `dialog`, `reasoning`, `validator`, `workflow`, `input_mapping`, or `options`. They cannot appear as members of a parallel group or as a `for_each` inline agent — route to them from those groups' `routes:` instead.
 
-**Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for `on_error` hooks and debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
+**Sub-workflow boundary** — a `status: failed` terminate inside a sub-workflow is downgraded to a `SubworkflowTerminatedError` (subclass of `ExecutionError`) at the parent boundary so the parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate step name are preserved on the wrapper as `terminated_output`, `terminated_reason`, and `terminated_by` for debugging surfaces. A `status: success` terminate inside a sub-workflow returns its rendered output cleanly and the parent continues with its next routes.
 
 See [`examples/terminate.yaml`](../examples/terminate.yaml) for a complete worked example with all three paths.
 
@@ -1196,6 +1450,7 @@ After the conversation, the agent re-executes with the dialog transcript as addi
 
 **Behavior notes:**
 - Dialog is supported on regular `agent` type only (not `human_gate`, `questions`, `script`, `workflow`, or `wait`)
+- In an interactive terminal, a reply may span multiple lines — paste or type freely and submit the turn with `/send` on its own line. A dismiss keyword ends the dialog the same way, so `done` needs `/send` after it there; off a tty every line is already a turn, so it does not. Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows) also submits whatever lines have been entered so far, or dismisses the dialog when none have — so abandoning a part-written reply that way sends the lines already entered; press it on an empty prompt to leave without sending. An empty or whitespace-only submission is skipped rather than sent. Off a tty (a pipe or CI) replies are read one line at a time and `/send` does not apply, though a blank line is skipped rather than sent as an empty turn. The web dashboard is unaffected — its chat box takes a separate path that has always delivered each message whole, multi-line included
 - In web dashboard mode, the dialog temporarily replaces the graph area with a chat interface
 - When `--skip-gates` is set (e.g., CI/automation), dialogs are automatically skipped
 - The evaluator prompt should describe *when* to trigger dialog, not *what* to ask — the evaluator generates the opening question from the agent's output context
@@ -1225,7 +1480,9 @@ agents:
 1. The primary agent runs and produces output.
 2. The validator runs a second LLM call that receives the agent's rendered prompt, its output, and the `criteria`, and must answer `{ "passed": bool, "issues": [str, ...] }`.
 3. If `passed` is true, the output flows downstream unchanged.
-4. If `passed` is false and `max_retries > 0`, the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt. The second output is taken as final — there is no second validation loop.
+4. If `passed` is false and `max_retries > 0`, the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt. The second output is taken as final — there is no second validation loop. On the `claude`, `openai`, and `hermes` providers this correction continues the completed agent conversation, preserving prior model and tool messages while sending only the validation feedback as the next user turn. Other providers keep their existing re-run behavior.
+
+   The continuation trade-off: the re-run carries the entire first conversation, including every tool exchange, so an agent that already burned most of its context window on the first attempt can overflow on the retry where a rebuilt prompt would have fit. When the re-run itself fails, the original output is kept and the failure is reported on the `agent_validation_failed` event (with the error) and in the console log.
 
 **Configuration:**
 
@@ -1255,15 +1512,15 @@ Execute a fixed list of agents in parallel:
 parallel:
   - name: string                    # Required: Group identifier
     description: string             # Optional: Purpose description
-    
+
     agents:                         # Required: Agents to run in parallel
       - agent_name_1
       - agent_name_2
       - agent_name_3
-    
+
     failure_mode: fail_fast         # Required: Error handling strategy
                                     # Options: fail_fast | continue_on_error | all_or_nothing
-    
+
     routes:                         # Optional: Routes after parallel execution
       - to: next_agent
         when: "{{ condition }}"
@@ -1278,14 +1535,14 @@ for_each:
   - name: string                    # Required: Group identifier
     type: for_each                  # Required: Marks this as for-each group
     description: string             # Optional: Purpose description
-    
+
     source: string                  # Required: Reference to array in context
                                     # Example: "finder.output.items"
-    
+
     as: string                      # Required: Loop variable name
                                     # Available in templates as {{ <var> }}
                                     # Reserved names: workflow, context, output, _index, _key
-    
+
     agent:                          # Required: Inline agent definition
       model: string                 # Optional: Model override
       prompt: |                     # Required: Template with {{ <var> }}
@@ -1296,16 +1553,16 @@ for_each:
         {% endif %}
       output:                       # Optional: Output schema
         result: { type: string }
-    
+
     max_concurrent: 10              # Optional: Concurrent execution limit
                                     # Default: 10
-    
+
     failure_mode: fail_fast         # Optional: Error handling strategy
                                     # Default: fail_fast
-    
+
     key_by: string                  # Optional: Path for dict-based outputs
                                     # Example: "item.id" → outputs["123"]
-    
+
     routes:                         # Optional: Routes after execution
       - to: next_agent
 ```
@@ -1344,7 +1601,7 @@ agents:
   - name: summarizer
     prompt: |
       Summarize the research findings:
-      
+
       Web research: {{ parallel_researchers.outputs.web_researcher.summary }}
       Academic research: {{ parallel_researchers.outputs.academic_researcher.summary }}
       News research: {{ parallel_researchers.outputs.news_researcher.summary }}
@@ -1361,22 +1618,22 @@ agents:
   - name: aggregator
     prompt: |
       Process these results:
-      
+
       # Index-based access (when key_by not specified)
       First result: {{ processors.outputs[0].result }}
       Second result: {{ processors.outputs[1].result }}
-      
+
       # Key-based access (when key_by is specified)
       KPI-123 result: {{ analyzers.outputs["KPI-123"].analysis }}
-      
+
       # Iterate over all outputs
       {% for result in processors.outputs %}
       - {{ result | json }}
       {% endfor %}
-      
+
       # Access loop metadata
       Total processed: {{ processors.outputs | length }}
-      
+
       # Check for errors
       {% if processors.errors %}
       Failed items: {{ processors.errors | length }}
@@ -1441,7 +1698,7 @@ input:
     type: string
     required: true
     description: "The question to answer"
-  
+
   context:
     type: string
     required: false
@@ -1678,6 +1935,10 @@ workflow:
 
 See `examples/tool-output-limits.yaml` for a complete example.
 
+### OpenTelemetry Tracing
+
+OpenTelemetry tracing is configured exclusively via environment variables. For setup instructions, configuration options, and details on unified traces, see the [OpenTelemetry Tracing guide](telemetry.md).
+
 ## Tools
 
 Tools can be configured at workflow or agent level.
@@ -1727,6 +1988,54 @@ agents:
 ```
 
 For full MCP configuration details, see the [MCP Tools guide](mcp-tools.md).
+
+## MCP Exposure (`workflow.mcp:`)
+
+The `workflow.mcp:` block is unrelated to the `runtime.mcp_servers` section
+above. That section configures MCP **servers** this workflow calls as a
+*client*; this block configures how `conductor mcp serve` exposes *this
+workflow itself* as an MCP **tool** to a connected host.
+
+Every field is optional and defaults to exposing the workflow:
+
+```yaml
+workflow:
+  name: review-pr
+  mcp:
+    expose: true # default true — a candidate for MCP tool exposure
+    mode: async # async (default) | sync | auto
+    read_only: false # this workflow has no side effects
+    destructive: true # this workflow can destroy or irreversibly modify state
+    estimated_minutes: 8 # client-side hint for typical run duration
+```
+
+| Field | Type | Default | Meaning |
+|---|---|---|---|
+| `expose` | boolean | `true` | Whether this workflow is a candidate for MCP tool exposure. `conductor mcp serve`'s `--allow`/`--deny` flags outrank this field, which in turn outranks the default. |
+| `mode` | `async` \| `sync` \| `auto` | `async` | The invocation mode `conductor mcp serve` should use by default for this workflow. A hint, not a mandate — the caller's own `_wait_seconds` parameter can always override it per call. |
+| `read_only` | boolean | `false` | Whether this workflow only reads state, with no side effects. Surfaced to the MCP host as a tool annotation. |
+| `destructive` | boolean | `false` | Whether this workflow can destroy or irreversibly modify state. Surfaced to the MCP host as a tool annotation. |
+| `estimated_minutes` | integer \| `null` | `null` | Estimated wall-clock runtime in minutes, for client-side hints. Must be positive when present. |
+
+Because `workflow.mcp:` (like every other `WorkflowDef` field) rejects
+unknown keys, a typo such as `expse: false` is a `conductor validate` error
+rather than a silently ignored no-op — the reason this is a real schema
+block instead of riding the untyped `workflow.metadata:` bag.
+
+An absent `mcp:` block behaves identically to an explicit default one, so no
+existing workflow needs editing. `conductor validate` always reports the
+effective block and the tool name the workflow would publish (the slugified
+`workflow.name` — lowercased, with every character outside `A-Za-z0-9_-.`
+folded to `_`, and then `-` itself additionally folded to `_` to match
+Conductor's snake_case convention, so `review-pr` publishes as `review_pr`),
+so the generated name is inspectable without ever attaching
+an MCP host. Two things fail validation regardless of whether `mcp:` is
+declared, since every workflow is a candidate for exposure by default: a
+`workflow.input` named `_wait_seconds` (it collides with the parameter the
+tool generator reserves on every generated tool), and a `workflow.name` that
+cannot slugify to a legal 1–128-character tool name.
+
+See `examples/mcp-serve.yaml` for a complete example.
 
 ## Skills
 
@@ -1856,6 +2165,45 @@ Two consequences worth knowing:
   it fail mid-run. The same skill works on `copilot` untouched.
 * **Eager injection is expensive.** The bundled `conductor` skill alone is
   ~132KB (~33K tokens), prepended to *every* call and every retry.
+
+#### Loading a target repo's own skills (`claude-agent-sdk`)
+
+A repository that ships `.claude/skills` but no plugin manifest is unreachable
+through `skills:` on this provider. `runtime.provider.setting_sources` lets the
+workflow load the Claude Code settings tiers instead, which is how the `claude`
+CLI finds those skills natively:
+
+```yaml
+workflow:
+  runtime:
+    provider:
+      name: claude-agent-sdk
+      setting_sources: [project]   # user | project | local; empty by default
+  agents:
+    - name: reviewer
+      working_dir: ./target-repo   # the tier resolves against this directory
+      prompt: ...
+```
+
+`[project]` reads `<working_dir>/.claude/` — skills, `CLAUDE.md`, and
+`.claude/rules/*.md` — with no plugin packaging. `user` also reads
+`~/.claude/`, which makes the run depend on the operator's machine; prefer
+`[project]`.
+
+> **A tier brings its hooks.** `project` reads
+> `<working_dir>/.claude/settings.json`, whose `hooks` run shell commands on
+> tool events. Enable this only for repositories trusted as much as the
+> workflow itself. The field is workflow-global while `working_dir` is per
+> agent, so every agent on the provider loads the tiers against its own
+> directory (agents without a `working_dir` against the directory `conductor
+> run` was launched in). An agent with an explicit `skills: []` opts out of the
+> tiers entirely.
+
+When the workflow names no skills of its own, enabling a tier also widens the
+session's skill filter to whatever the tier discovered — otherwise the tier
+would load the repo's skills and then hide every one of them. A declared
+`skills:` / `plugins:` list still wins: discovery never widens it. See
+[`examples/claude-agent-sdk-setting-sources.yaml`](../examples/claude-agent-sdk-setting-sources.yaml).
 
 ### Limiting eager injection
 
@@ -1995,6 +2343,7 @@ actually install, and it ships up to three things Conductor can use:
   .claude-plugin/plugin.json   or  .github/plugin/plugin.json
   skills/<skill>/SKILL.md      → instructions
   agents/<agent>.agent.md      → subagents the model can dispatch to
+                                  (agents/<agent>.md for a Claude build — see Flavor below)
   .mcp.json                    → MCP servers
 ```
 
@@ -2022,7 +2371,7 @@ overrides.
 | Form | Resolution |
 |---|---|
 | `prs` | An installed plugin, looked up under `~/.copilot/installed-plugins/*/` and `~/.claude/plugins/*/`. An error if it is not installed, or if more than one marketplace ships that name |
-| `prs@acme` | The `prs` plugin from marketplace `acme` — declared in `plugin_sources`, or installed under that marketplace |
+| `prs@acme` | The `prs` plugin from marketplace `acme` — declared in `plugin_sources`, installed under that marketplace, or (for a `copilot`-flavored agent only) registered in `~/.copilot/settings.json`'s `extraKnownMarketplaces` |
 | `./tools/my-plugin` | A path, resolved against the workflow file's directory |
 
 Classification is syntactic — a path when the entry starts with `~` or `.`
@@ -2034,6 +2383,38 @@ happens to exist. The path check runs first, so a directory called
 `prs@acme` is also the answer to the ambiguity error above: when two
 marketplaces ship a `git` plugin, qualify it rather than falling back to a
 path.
+
+### Flavor: which build a plugin resolves to
+
+A plugin can be **built for either CLI** — Claude Code writes
+`.claude-plugin/plugin.json` with `agents/<agent>.md`; the Copilot CLI
+writes `.github/plugin/plugin.json` with `agents/<agent>.agent.md`. The
+two agent-file conventions are read off whichever manifest actually
+matched, never assumed from where the plugin happens to live — a
+Copilot-built plugin can sit inside a `~/.claude/plugins/` tree (a real
+configuration: a marketplace directory the Claude CLI manages, holding a
+build meant for Copilot), and it still resolves every subagent it ships
+correctly on a `provider: copilot` agent.
+
+Flavor only ever **breaks a tie**, never gates whether a plugin can be
+read. Two situations actually have a tie to break:
+
+* A marketplace that publishes **both builds** — a `.claude-plugin/marketplace.json`
+  and a `.github/plugin/marketplace.json` in one repository, each pointing
+  at its own build directory. `prs@acme` resolves to whichever build
+  matches the requesting agent's provider.
+* A bare name installed **once per CLI under the same marketplace
+  directory name** — `prs` under both `~/.copilot/installed-plugins/acme/`
+  and `~/.claude/plugins/acme/`. Two *different* marketplace names sharing
+  a plugin name stay an ambiguity error regardless of flavor; that is a
+  genuinely different plugin per marketplace, and picking one silently is
+  exactly the per-machine drift this feature prevents.
+
+Every other case is unaffected: a plugin that ships only one build
+resolves that build for every agent, whichever provider runs it.
+
+`conductor plugin list` prints the flavor it resolved each group of
+agents against, alongside the usual component counts.
 
 ### Declaring where plugins come from
 
@@ -2067,6 +2448,17 @@ The load-bearing property: **`prs@acme` means the same thing** whether
 `acme` was declared here, installed via a CLI, or is a local directory. A
 declared source registers its name into the same table the installed
 marketplaces populate, and wins on a clash.
+
+A `copilot`-flavored agent has one further fallback: a marketplace
+registered in `~/.copilot/settings.json` (the Copilot CLI's own
+`extraKnownMarketplaces`, whatever the `copilot` CLI already has you
+pointed at) resolves too, when nothing declared or installed already
+matches. This is deliberately the last thing consulted — it can only turn
+a hard "no such marketplace" error into a resolution, never change an
+answer a declared source or an installed root already gave — and it comes
+with a printed advisory naming the standalone remedy: declaring the same
+marketplace under `plugin_sources` so the workflow resolves identically on
+a machine that never ran `copilot`'s own marketplace-add flow.
 
 A source may be a **marketplace catalog** (a `marketplace.json` listing
 many plugins) or a **single plugin** (a `plugin.json` at the root). Both
@@ -2243,6 +2635,111 @@ agent, without validating anything else.
 
 See `examples/plugins.yaml` and `examples/plugin-sources.yaml` for complete
 examples.
+
+## Context Compaction
+
+When a conversation with an agent grows too large, it can exceed the model's context window and cause the provider to reject requests. To prevent this, Conductor features an automatic, always-on client-side context compaction mechanism for `claude` and `openai` providers. When the history size crosses a computed trigger threshold, Conductor automatically condenses the context.
+
+### Trigger Threshold and Targets
+
+Compaction does not trigger at a fixed percentage of the context window. Instead, it uses a reserve-based formula to guarantee the model has enough room to output a complete answer and receive tool results.
+
+The trigger threshold is calculated using the following formula:
+
+$$\text{Trigger} = \text{Context Window} - \text{Output Limit} - \text{Effective Tool Buffer}$$
+
+Here, the output limit (output_limit) is the minimum of:
+*   The effective max_tokens actually sent to the API. This has the source `settings` if explicitly configured under `runtime.max_tokens`, or the source `default` (the unified 16384 default, including any adjustment after Claude thinking coercion).
+*   The model output cap reported by the provider (with the source `provider-cap`).
+
+The tool buffer is calculated using the configured tool output limit:
+
+$$\text{Buffer} = 2 \times \lceil\text{max\_chars} / 4\rceil + 15,000$$
+
+This buffer assumes a character-to-token ratio of 4 and reserves space for 2 worst-case tool results as a sizing heuristic. A workflow using more than two parallel calls per turn might exceed this budget, meaning this is a sizing heuristic, not a guarantee. The **effective** tool buffer is this value clamped to at most 25% of the resolved context window, so a pathological `tool_output.max_chars` cannot consume the entire window.
+
+Compaction is **disabled** when the remaining trigger would fall below 4096 tokens (or the computed target would drop below 1 token) — arming a degenerate threshold would compact on every turn. A disabled plan is reported on the `agent_compaction_config` event via `enabled: false` and a `disabled_reason`; the remedy is lowering `runtime.max_tokens` or `tool_output.max_chars`.
+
+The target ceiling to which compaction condenses the history is calculated as:
+
+$$\text{Target} = \min(\lfloor\text{Context Window} \times 0.55\rfloor, \text{Trigger} - \text{Margin})$$
+
+where the margin is a window-scaled 5% of the context window (minimum 1 token). This keeps the target strictly below the trigger, establishing a hysteresis gap so the agent does not trigger compaction again immediately on the next turn.
+
+#### Worked Examples
+
+Below is how these values resolve in practice for different configurations using the default tool buffer of 40,000 tokens (50,000 character limit):
+
+*   **128k Window, default 16,384 Output Limit:**
+    *   Trigger: 128,000 minus 16,384 minus min(40,000, 32,000), which equals 79,616 tokens (about 62% of the window)
+    *   Target: min(70,400, 79,616 minus 6,400), which equals 70,400 tokens
+*   **200k Window, default 16,384 Output Limit:**
+    *   Trigger: 200,000 minus 16,384 minus min(40,000, 50,000), which equals 143,616 tokens (about 72% of the window)
+    *   Target: min(110,000, 143,616 minus 10,000), which equals 110,000 tokens
+*   **1M Window, default 16,384 Output Limit:**
+    *   Trigger: 1,000,000 minus 16,384 minus min(40,000, 250,000), which equals 943,616 tokens (about 94% of the window)
+    *   Target: min(550,000, 943,616 minus 50,000), which equals 550,000 tokens
+
+#### Disabled-Compaction Visibility
+
+When the reserve (output limit plus effective tool buffer) leaves no viable headroom below the window, compaction is disabled for the agent execution rather than armed with a degenerate threshold. The `agent_compaction_config` event then carries `enabled: false` and a `disabled_reason`, so the condition is visible per run instead of surfacing as a one-shot log warning. To resolve this, lower `runtime.max_tokens` or `tool_output.max_chars`.
+
+#### Window Guard Against Token-Dense Content
+
+The trigger is measured by the primary estimator: the provider's reported token usage for the history up to the most recent response, plus a ~4-characters-per-token heuristic for everything after it. That heuristic undercounts token-dense content — CJK and other non-Latin scripts, base64, hex, or minified data — by 2-4x, so a dense suffix can grow the real request past the known context window while the trigger estimate stays below the threshold.
+
+A second, density-calibrated estimate guards the hard window. It matches the primary heuristic on ordinary prose, counts text with a substantial non-ASCII share at ~1 token per character, and whitespace-poor ASCII blobs at ~2 characters per token. When that estimate reaches the known window, compaction runs even if the trigger never fired, and the tier chain is driven against the density-calibrated measurement until the history fits the target. Because the two estimates agree on ordinary text, the guard never compacts a history that is merely large.
+
+The start event reports which gate fired via `trigger_reason` (`"trigger"` or `"window_guard"`) and carries the density-calibrated value separately as `density_tokens`; `tokens_before` always stays the primary token estimate.
+
+### Compaction Tiers
+
+Conductor uses three sequential tiers to compress the history down to the target:
+
+1.  **Clear Tool Results:** Keeps the most recent three tool call and return pairs, replacing older tool output payloads with simple truncation markers.
+2.  **Summarize History:** Summarizes older messages using an internal model call. The model preserves the most recent 20 messages in their original form.
+3.  **Sliding Window:** Discards the oldest messages. This is a deterministic final fallback that runs if summarization fails or doesn't reclaim enough tokens.
+
+### Resolution Cascades
+
+Conductor resolves the context window and output limit via these priority cascades:
+
+#### Context Window Cascade
+1.  Authoritative provider metadata (e.g., `models.list()` on Claude or vendor-advertised limits on OpenAI-compatible endpoints).
+2.  The `genai-prices` registry, active only when using first-party base URLs.
+3.  Conservative default fallback of 128,000 tokens.
+
+#### Output Limit Cascade
+1.  Effective `max_tokens` actually sent to the API (source is `settings` or `default`).
+2.  The provider-reported per-model output cap (source is `provider-cap`).
+
+### Customization and Overrides
+
+You don't configure compaction inside the workflow YAML files, and no user-facing context window override exists. Tune the trigger by adjusting `runtime.max_tokens` or `runtime.tool_output.max_chars`.
+
+#### Loop-back History Behavior
+
+When a workflow runs the same agent multiple times using loop-back routing, the provider-level history does not accumulate across those iterations. Each agent execution starts a fresh model session. History only accumulates within a single execution step (for example, when an agent makes multiple tool calls in a single turn).
+
+### Usage limits and Costs
+
+A summarizing compaction step runs a nested model call that inherits the parent agent's configuration. This summary call consumes one request slot from the agent's `max_agent_iterations` budget. If your agent uses low iteration limits, compaction can cause a `UsageLimitExceeded` error, which maps to a non-retryable provider error. We recommend setting `max_agent_iterations` to at least 5 when expecting heavy compaction.
+
+All tokens consumed by summarizing compaction are added to the workflow's total usage and cost metrics.
+
+### Observability and Events
+
+Compaction operates in a fail-open manner. If an error occurs during compaction, Conductor logs a warning, disables compaction for the rest of that agent's execution, and continues with the uncompacted history. A failed context measurement never disables anything: the primary estimate falls back to an independent density-calibrated one, and only when both fail is compaction skipped for that request alone, reported as `agent_compaction_skipped` with `reason: "estimate_unavailable"`.
+
+Conductor emits four event types to track compaction:
+*   `agent_compaction_config`: Emitted once at the start of agent execution to log resolved window and limit values.
+*   `agent_compaction_start`: Emitted when compaction begins. `trigger_reason` names the gate that fired (`"trigger"` or `"window_guard"`), and `density_tokens` carries the density-calibrated estimate alongside the primary-scale `tokens_before`.
+*   `agent_compaction_complete`: Emitted when compaction completes, detailing token savings or errors. Degraded outcomes are named rather than hidden: `degraded_tiers` for recovered tier failures, `degraded_estimators` for lost measurements, `still_over_trigger` when the history remains above the trigger, and `still_over_window` when a window-guard compaction could not get back below the known window.
+*   `agent_compaction_skipped`: Emitted when compaction did not run because the context size could not be measured at all.
+
+### Dashboard Caveat
+
+The web dashboard's context remaining bar estimates context size using only provider-supplied model limits. It might disagree with the actual compaction window, especially under proxy configurations. The bar is refreshed only when the agent step completes; a mid-execution compaction shows up in the activity log, not in the bar.
 
 ## External File References
 
@@ -2503,34 +3000,6 @@ Only UTF-8 text files are supported. Non-UTF-8 files produce a `ConfigurationErr
 - **No caching** — Each `!file` reference reads the file independently
 - **Jinja includes search root**: Relative template includes (`{% include %}`, etc.) resolve only against the prompt file's own directory, with no fallback to the workflow directory or current working directory.
 
-## Hooks
-
-Lifecycle hooks execute template expressions at key workflow events:
-
-```yaml
-workflow:
-  hooks:
-    on_start: "{{ 'Starting workflow: ' + workflow.name }}"
-    on_complete: "{{ 'Workflow completed in ' + str(workflow.execution_time) + 's' }}"
-    on_error: "{{ 'Workflow failed: ' + workflow.error.message }}"
-```
-
-### Available Hook Contexts
-
-**`on_start`**:
-- `workflow.name`, `workflow.description`, `workflow.dir`, `workflow.file`
-- `workflow.input.*` (all input values)
-
-**`on_complete`**:
-- All agent outputs
-- `workflow.execution_time` (total seconds)
-- `workflow.iteration_count` (total iterations)
-
-**`on_error`**:
-- `workflow.error.message` (error message)
-- `workflow.error.agent` (agent that failed)
-- Partial agent outputs (agents that completed before failure)
-
 ## Complete Example
 
 ```yaml
@@ -2538,11 +3007,11 @@ workflow:
   name: code-review
   description: Multi-stage code review with parallel validation
   entry_point: analyzer
-  
+
   limits:
     max_iterations: 20
     timeout_seconds: 600
-  
+
   context_mode: accumulate
 
 input:
@@ -2584,19 +3053,19 @@ agents:
     output:
       security_issues:
         type: array
-  
+
   - name: performance_check
     prompt: "Check for performance issues: {{ analyzer.output.issues }}"
     output:
       performance_issues:
         type: array
-  
+
   - name: style_check
     prompt: "Check for style violations: {{ analyzer.output.issues }}"
     output:
       style_issues:
         type: array
-  
+
   - name: summarizer
     prompt: |
       Summarize findings:

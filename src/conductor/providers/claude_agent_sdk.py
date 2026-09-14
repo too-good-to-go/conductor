@@ -11,8 +11,9 @@ import sys
 import tempfile
 import time
 import unicodedata
+from collections.abc import Sequence
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Final, cast
+from typing import TYPE_CHECKING, Any, Final, Literal, cast
 
 from conductor.exceptions import ProviderError
 from conductor.install_hint import install_command
@@ -247,6 +248,11 @@ _TOOL_RESULT_PREVIEW_LEN: Final[int] = 500
 # in pyproject.toml.
 _DEFAULT_MODEL: Final[str] = "claude-sonnet-4-5"
 
+# Claude Code settings tiers, mirroring the SDK's own `SettingSource`. Kept as
+# a local alias rather than imported so the narrowing survives when the SDK is
+# absent (the ImportError fallback binds its symbols to `Any`).
+SettingSource = Literal["user", "project", "local"]
+
 # Sentinel meaning "expose every tool this server offers" in
 # ``MCPServerDef.tools``. Any other value narrows, honored by denying the
 # complement — see :func:`_server_tool_filters`.
@@ -303,11 +309,15 @@ def _server_tool_filters(mcp_servers: dict[str, Any]) -> dict[str, set[str]]:
 
 
 def _stdio_path_args(mcp_servers: dict[str, Any]) -> list[str]:
-    """Absolute directory args of stdio MCP servers, for ``add_dirs``.
+    """Absolute directory args of stdio MCP servers.
 
-    The CLI's MCP Roots override a server's own path args with cwd +
-    ``--add-dir``, so a server declared with two directories is rooted at one
-    and the rest denied. Forwarding these restores the declared scope.
+    Currently uncalled. Do NOT wire this into ``add_dirs``: ``--add-dir``
+    takes no part in MCP Roots negotiation, so it cannot widen what a server
+    permits. The CLI advertises exactly one root, its cwd, and a client's sole
+    root replaces every argv root outright —
+    ``tests/test_integration/test_mcp_roots_negotiation.py`` pins that against
+    the real server. ``AgentDef.settings_dir`` is the only source of
+    ``add_dirs``.
     """
     paths: list[str] = []
     for config in mcp_servers.values():
@@ -319,7 +329,9 @@ def _stdio_path_args(mcp_servers: dict[str, Any]) -> list[str]:
     return sorted(set(paths))
 
 
-def _resolve_skill_filter(skill_names: list[str], setting_sources: list[str]) -> list[str] | str:
+def _resolve_skill_filter(
+    skill_names: list[str], setting_sources: Sequence[SettingSource]
+) -> list[str] | Literal["all"]:
     """Value for ``ClaudeAgentOptions.skills`` — the name-level skill filter.
 
     Three cases, and the middle one is why this is not just ``skill_names``:
@@ -327,13 +339,13 @@ def _resolve_skill_filter(skill_names: list[str], setting_sources: list[str]) ->
     * Skills named by the workflow -> that exact list. An explicit
       ``skills:``/``plugins:`` declaration is the allowlist; settings-tier
       discovery does not widen what the author asked for.
-    * No named skills but a non-empty ``setting_sources`` -> ``"all"``. The
-      CLI discovers skills from the enabled tiers and they never appear in
-      ``skill_names``, so ``[]`` would permit nothing: the model would see the
-      repo's skills in its listing (which this filter does not suppress) and
-      every call would fail with "not in this session's skills allowlist".
-      ``"all"`` resolves to precisely what the enabled tiers found — the set
-      enabling them asked for.
+    * No named skills but a non-empty ``setting_sources`` -> ``"all"``. Skills
+      the CLI discovers from the enabled tiers never appear in
+      ``skill_names``, and ``[]`` sets the session's skill allowlist to empty
+      — which hides them from the model's listing and has the ``Skill`` tool
+      reject them. Enabling a tier would then load the repo's skills and hide
+      every one of them. ``"all"`` omits the filter, leaving exactly what the
+      enabled tiers discovered — the set enabling them asked for.
     * Neither -> ``[]``, an honest opt-out that enables nothing.
 
     Returns:
@@ -692,6 +704,9 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # rather than being stamped individually as they are for Copilot:
         # the SDK's ``McpStdioServerConfig`` has no cwd field.
         working_dir=True,
+        # ``settings_dir`` reaches ``ClaudeAgentOptions.add_dirs``, the CLI's
+        # ``--add-dir``. It is the only provider that has anywhere to put it.
+        settings_dir=True,
         # Skills are loaded natively: the owning plugin is registered via
         # ``ClaudeAgentOptions.plugins`` and enabled by its qualified name
         # through ``skills``, so the model reads the frontmatter up front
@@ -704,6 +719,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # ``ClaudeAgentOptions.agents``, MCP through the same temp-file
         # config the workflow's own servers use.
         plugins=True,
+        # Reads the Claude build's ``agents/*.md`` convention (issue #497).
+        # Only breaks ties where a genuine choice exists — parsing always
+        # follows whichever manifest convention actually matched.
+        plugin_flavor="claude",
         # ``session_key`` is honored: executions sharing a key resume one
         # Claude session, and the map is persisted across ``conductor resume``.
         session_continuity=True,
@@ -718,7 +737,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         max_turns: int | None = None,
         max_session_seconds: float | None = None,
         mcp_servers: dict[str, Any] | None = None,
-        setting_sources: list[str] | None = None,
+        setting_sources: Sequence[SettingSource] | None = None,
     ) -> None:
         if not CLAUDE_AGENT_SDK_AVAILABLE:
             raise ProviderError(
@@ -730,7 +749,22 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # re-defaults an unset ``setting_sources`` to ``["user", "project"]``
         # whenever ``skills`` is set, so the empty list must be sent explicitly.
         # See the option block in ``execute``.
-        self._setting_sources: list[str] = list(setting_sources or [])
+        self._setting_sources: list[SettingSource] = list(setting_sources or [])
+        if self._setting_sources:
+            # Trust decision worth naming before the run rather than
+            # discovering after it, in the same spirit as the validator's
+            # dropped-component warnings: a tier brings its hooks, and those
+            # run shell commands on tool events.
+            logger.warning(
+                "claude-agent-sdk: ambient settings tiers enabled (%s). Sessions on this "
+                "provider load settings, instructions and HOOKS from those tiers -- "
+                "'project' reads <working_dir>/.claude/settings.json, whose hooks run "
+                "shell commands on tool events. This applies to every agent on the "
+                "provider, each resolving the tier against its own working_dir (agents "
+                "without one resolve against the directory `conductor run` was launched "
+                "in). Enable only for repositories trusted as much as the workflow.",
+                ", ".join(self._setting_sources),
+            )
         self._default_model = model or _DEFAULT_MODEL
         self._default_max_turns = max_turns if max_turns is not None else 50
         self._max_session_seconds = max_session_seconds
@@ -749,6 +783,28 @@ class ClaudeAgentSdkProvider(AgentProvider):
         # Serialized: enumeration spawns every declared server.
         self._enumerate_lock = asyncio.Lock()
         self._session_ids: dict[tuple[str, str], str] = {}
+        # settings_dir values already warned about for having no `project`
+        # tier, keyed by `(resolved directory, cause)`:
+        #
+        # - The directory, not the agent name: the engine renames a for_each
+        #   member per item (`<agent>[<key>]`, engine/workflow.py), so any
+        #   name-bearing key emits one line per item -- the very case latching
+        #   exists to prevent. All members of one loop share a directory and a
+        #   cause, so they collapse to one line.
+        # - Not a bare flag: `settings_dir` is Jinja-rendered per execution, so
+        #   one agent can name several directories across loop-backs, and each
+        #   is a distinct grant the operator needs told about.
+        # - Plus the cause, because the remedy below depends on it: two agents
+        #   can name the same directory for different reasons, and one line
+        #   would prescribe a fix that is wrong for the other. Bounded at two
+        #   lines per directory.
+        #
+        # The residual cost, accepted: two agents naming the same directory
+        # for the SAME reason warn once, naming only the first. The remedy is
+        # then identical for both, so the second line would add nothing.
+        #
+        # Matches the `_warned` convention in claude.py and engine/workflow.py.
+        self._settings_dir_tier_warned: set[tuple[str, bool]] = set()
         self._resume_session_ids: dict[tuple[str, str], str] = {}
         # Slots currently executing, so a second execution cannot resume a
         # session the first still has open — see :meth:`_claim_session_slot`.
@@ -801,12 +857,14 @@ class ClaudeAgentSdkProvider(AgentProvider):
         agent: AgentDef,
         context: dict[str, Any],
         rendered_prompt: str,
+        *,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Run one agent, holding its ``session_key`` slot for the duration.
 
@@ -816,7 +874,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
         output. ``context`` is unused — the executor renders the prompt before
         it reaches any provider. The SDK-availability check lives in
         :meth:`_execute_session`, alongside the symbols it guards.
+        ``continuation_state`` is ignored: the CLI owns its transcripts, so
+        ``supports_continuation`` is ``False``, this provider never populates
+        ``AgentOutput.continuation_state``, and it is never handed one back.
         """
+        del continuation_state  # No continuation surface (see docstring).
         # Resolved before anything else so the session slot is known: the slot
         # is ``(session_key, cwd)``, and a claim taken later would leave the
         # window it exists to close.
@@ -975,8 +1037,57 @@ class ClaudeAgentSdkProvider(AgentProvider):
             )
             server_denied = _server_filter_denials(enumerated_mcp_tools, self._server_tool_filters)
 
-        # Restores the MCP scope the CLI's Roots would otherwise collapse to cwd.
-        add_dirs = _stdio_path_args({**self._mcp_servers, **(extra_mcp_servers or {})})
+        # ``skills: []`` is the documented per-agent opt-out, and it outranks a
+        # workflow-global settings tier: an agent that asked for no skills gets
+        # none, tier or not. ``agent.skills is None`` (omitted) is a different
+        # signal and keeps the tier — same raw tri-state ``_resolve_tool_config``
+        # reads off ``agent.tools``.
+        effective_sources: list[SettingSource] = [] if agent.skills == [] else self._setting_sources
+
+        # A settings_dir whose `project` tier is not enabled discovers no
+        # skills -- and the filesystem grant applies anyway, so the one effect
+        # the author did not ask for is the only one they get.
+        # ``conductor validate`` warns about this, but ``conductor run`` never
+        # calls the static validator, so without this the run is silent about
+        # a no-op the author is relying on. Warned rather than raised, matching
+        # validate's own choice: the workflow is not wrong, just ineffective.
+        opted_out = agent.skills == []
+        if (
+            agent.settings_dir is not None
+            and "project" not in effective_sources
+            and (agent.settings_dir, opted_out) not in self._settings_dir_tier_warned
+        ):
+            self._settings_dir_tier_warned.add((agent.settings_dir, opted_out))
+            # The remedy depends on the cause, as it does in
+            # config/validator.py: telling an author to add 'project' when
+            # their own `skills: []` is what zeroed the tier sends them to add
+            # a value that is already there, and the warning keeps firing.
+            #
+            # The other arm covers two of validator.py's causes at once -- a
+            # missing tier, and a per-agent provider override, where the tier
+            # cannot be enabled at all because the schema accepts
+            # `setting_sources` only when `runtime.provider` is
+            # 'claude-agent-sdk'. The provider does not know the
+            # workflow-level provider name, so the wording names the
+            # requirement rather than prescribing an edit that would be
+            # refused on that path.
+            remedy = (
+                "This agent's own 'skills: []' opts it out of the settings tiers "
+                "entirely; remove it to let the tier apply"
+                if opted_out
+                else "Enable the 'project' tier via runtime.provider.setting_sources, "
+                "which requires runtime.provider itself to be 'claude-agent-sdk'"
+            )
+            logger.warning(
+                "Agent '%s' sets settings_dir=%r but its session does not enable the "
+                "'project' settings tier, so no skills are discovered from that "
+                "directory. The directory is still granted to the model's built-in "
+                "file tools. %s, or remove settings_dir if the filesystem grant was "
+                "not intended.",
+                agent.name,
+                agent.settings_dir,
+                remedy,
+            )
 
         sdk_tools, permission_mode, allowed_tools, disallowed_tools = self._resolve_tool_config(
             tools,
@@ -984,12 +1095,11 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # Either route to a skill counts. ``skill_names`` covers the ones
             # Conductor resolved (``skills:``/``plugins:``/discovery); a
             # non-empty ``setting_sources`` means the CLI does its own
-            # discovery from the session's settings tiers, and those skills are
-            # listed to the model without ever passing through
-            # ``skill_names``. Granting on the union is what stops the second
-            # route from being discovery without execution: the model would see
-            # the skill in its listing and hold no tool to invoke it with.
-            skills_enabled=bool(skill_names) or bool(self._setting_sources),
+            # discovery from the session's settings tiers, and those skills
+            # never pass through ``skill_names``. Granting on the union is what
+            # stops the second route from being discovery without execution:
+            # the model would be shown the skill and hold no tool to invoke it.
+            skills_enabled=bool(skill_names) or bool(effective_sources),
             agents_enabled=bool(custom_agents),
             enumerated_mcp_tools=enumerated_mcp_tools,
         )
@@ -1012,8 +1122,34 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # so pass it through verbatim rather than re-resolving — that would
             # collapse the symlink aliases the engine preserves.
             cwd=resolved_cwd,
-            # MCP Roots collapse a server's own path args to cwd without these.
-            add_dirs=add_dirs,
+            # The authored ``settings_dir`` and nothing else. Two effects,
+            # and the order matters because the second is easy to miss.
+            #
+            # (1) UNCONDITIONAL: per the SDK's own contract this is
+            #     "additional directories Claude can access beyond the current
+            #     working directory", so this line widens the model's built-in
+            #     Read/Edit/Bash to that tree with no settings tier enabled at
+            #     all (measured). It does NOT widen what an MCP server permits.
+            #
+            # (2) CONDITIONAL on ``setting_sources`` enabling the ``project``
+            #     tier: the directory's ``.claude/skills`` become listed and
+            #     invocable with cwd elsewhere entirely, and only those — not
+            #     CLAUDE.md, .claude/rules/*.md, .claude/settings.json (so no
+            #     env and no hooks) or .claude/agents, which all stay with cwd.
+            #     So it is the skills portion of a project tier rather than a
+            #     cwd-independent way to load one.
+            #
+            # Do not extend this to the directory args of stdio MCP servers to
+            # widen what those servers may read: it cannot work. A filesystem
+            # MCP server uses its argv directories only when the client does
+            # not support MCP Roots, and the CLI does support Roots —
+            # advertising exactly one, its cwd — so the server discards its
+            # argv directories and permits cwd alone. ``--add-dir`` takes no
+            # part in that negotiation; it widens the CLI's own file tools,
+            # never what a server permits. Measured: cwd alone is the
+            # effective allowlist whether or not every declared root is also
+            # passed here.
+            add_dirs=[agent.settings_dir] if agent.settings_dir else [],
             output_format=_build_output_format(agent.output) if agent.output else None,
             max_turns=max_turns,
             permission_mode=permission_mode,
@@ -1048,7 +1184,10 @@ class ClaudeAgentSdkProvider(AgentProvider):
             #
             # A tier brings everything it defines, hooks included, so this is
             # only for repositories trusted as much as the workflow itself.
-            setting_sources=self._setting_sources,
+            # `effective_sources`, not the provider field: an agent that
+            # declared `skills: []` opts out of the tier entirely, hooks
+            # included.
+            setting_sources=effective_sources,
             # Load-bearing but invisible in argv: the SDK forwards an explicit
             # list in the `initialize` control request (_internal/query.py), and
             # only there does [] differ from None. None means "CLI defaults
@@ -1058,16 +1197,16 @@ class ClaudeAgentSdkProvider(AgentProvider):
             # rejected by the Skill tool, but their files stay readable on disk.
             #
             # `"all"` when the workflow opted into settings-tier discovery and
-            # named no skills itself. This is a SECOND gate, distinct from the
-            # `Skill` tool grant in `_resolve_tool_config`: a session can hold
-            # the tool and still have every call rejected. Skills discovered
-            # from a settings tier never pass through `skill_names`, so sending
-            # `[]` there permits nothing — the model lists the repo's skills
-            # (the listing leaks past this filter) and every invocation comes
-            # back "not in this session's skills allowlist". `"all"` widens the
-            # filter to exactly what the enabled tiers discovered, which is the
-            # set the workflow asked for by enabling them.
-            skills=_resolve_skill_filter(skill_names, self._setting_sources),
+            # named no skills itself. Skills discovered from a settings tier
+            # never pass through `skill_names`, so sending `[]` alongside a
+            # tier sets the session allowlist to empty and suppresses them from
+            # the listing outright: the tier would load the repo's skills and
+            # then hide every one of them. `"all"` omits the filter, leaving
+            # exactly what the enabled tiers discovered. This is a SECOND gate,
+            # distinct from the `Skill` tool grant in `_resolve_tool_config`: a
+            # session can hold the tool and still have a call rejected by the
+            # allowlist backstop if the model names a skill it was never shown.
+            skills=_resolve_skill_filter(skill_names, effective_sources),
             # Unlike `skills`, [] is already this field's default and means
             # nothing special.
             plugins=skill_plugins,
@@ -1409,7 +1548,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         Tools are disabled and no MCP server attaches — this is a plain
         text-in/text-out turn, matching the other providers.
         """
-        if not CLAUDE_AGENT_SDK_AVAILABLE:
+        if query is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
 
         prior = "".join(
@@ -1720,15 +1859,20 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 omitted-vs-explicit-empty signal; ``agent.name`` is used in
                 the error message.
             skills_enabled: Whether this agent can reach a skill by any
-                route — resolved by Conductor (``skills:``/``plugins:``/
-                discovery) *or* discovered by the CLI itself from a non-empty
-                ``setting_sources``. Adds the ``Skill`` tool: to an explicit
-                ``tools: []`` as its one carve-out, and to a non-empty
-                allowlist alongside the tools the agent declared. Without it
-                a listed skill is unusable — visible to the model with no
-                tool to invoke it.
-            enumerated_mcp_tools: Every ``<server>__<tool>`` the declared servers
-                expose, used to compute the complement to deny.
+                route — resolved by Conductor (``skills:``/``plugins:``) *or*
+                discovered by the CLI itself from a non-empty
+                ``setting_sources`` (an agent's own ``skills: []`` opts out
+                of the tier and so out of this too). Adds the ``Skill`` tool
+                on both paths: to an explicit ``tools: []`` as its one
+                carve-out, and appended to a non-empty allowlist alongside the
+                tools the agent declared. Without the tool the CLI shows the
+                model no skill listing at all, so a tier would discover skills
+                that can never be reached.
+            enumerated_mcp_tools: Every ``<server>__<tool>`` the declared
+                stdio servers expose, used to compute the complement to deny.
+                Only passed when the agent declares a non-empty allowlist or a
+                per-server filter is in force, since enumeration starts the
+                servers.
 
         Returns:
             A ``(sdk_tools, permission_mode, allowed_tools, disallowed_tools)``

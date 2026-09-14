@@ -1,0 +1,20 @@
+# A workflow that declares the removed `hooks:` block (#476).
+# Loading this must fail validation, not silently no-op.
+workflow:
+  name: hooks-removed
+  entry_point: agent1
+  hooks:
+    on_start: "{{ workflow.name }}"
+    on_complete: "done"
+    on_error: "failed"
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    output:
+      result:
+        type: string
+    routes:
+      - to: $end
+output:
+  result: "{{ agent1.output.result }}"

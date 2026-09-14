@@ -23,9 +23,11 @@ import os
 import sys
 import threading
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
+from textual.widgets._directory_tree import DirEntry
 
 from conductor.cli.app import Identity
 from conductor.cli.app import stop_records as cli_stop_records
@@ -33,7 +35,7 @@ from conductor.fleet.records import RunRecord, read_run_record, write_run_record
 from conductor.fleet.tui import actions as tui_actions
 from conductor.fleet.tui.app import FleetApp
 from conductor.fleet.tui.screens.runs import RunsScreen
-from tests.test_fleet.conftest import settle
+from tests.test_fleet.conftest import settle, wait_for
 
 # ---------------------------------------------------------------------------
 # Helpers (mirroring tests/test_cli/test_stop.py's established patterns)
@@ -1288,11 +1290,36 @@ class TestDirectoryPickerModal:
     valid directory."""
 
     @staticmethod
-    async def _push(app: FleetApp, current: Path) -> dict[str, object]:
-        """Push :class:`DirectoryPickerModal` via ``push_screen_wait`` in a
-        worker, mirroring ``TestGateOptionsModalMarkupSafety``'s pattern --
-        a plain ``push_screen`` wouldn't let the test read the eventual
-        dismiss result."""
+    async def _push(pilot: Any, app: FleetApp, current: Path) -> dict[str, object]:
+        """Push :class:`DirectoryPickerModal` and wait until it has settled.
+
+        Pushing goes through ``push_screen_wait`` in a worker, mirroring
+        ``TestGateOptionsModalMarkupSafety``'s pattern -- a plain
+        ``push_screen`` wouldn't let the test read the eventual dismiss
+        result.
+
+        Waiting for ``#dir-path`` to actually *hold* focus is the
+        load-bearing half, and is why this takes a ``pilot``. "The modal is
+        on the stack and composed" and "the modal's mount-time focus has
+        landed" are two different moments: ``DirectoryPickerModal.on_mount``
+        focuses the input, and ``Widget.focus()`` defers the real work to
+        ``App.call_later``. A test that focused another widget in between
+        therefore *lost* it -- its own ``call_later`` ran first, and the
+        modal's mount-time focus arrived afterwards and won.
+
+        A single ``pilot.pause()`` hid that gap on Linux but not on Windows.
+        ``Pilot.pause()`` returns once ``textual._wait.wait_for_idle``
+        judges the process idle by comparing ``time.process_time()`` against
+        wall clock, and Windows reports process time in ~15.6ms ticks, so
+        that comparison reads no CPU used and returns after its first sleep
+        however much work is still queued. That is how
+        ``test_tree_highlight_while_focused_mirrors_into_the_input`` failed
+        on Windows CI (screen mounted, ``screen.focused`` still ``None``)
+        while passing everywhere else -- the same fixed-guess-about-machine-
+        speed mistake ``wait_for`` was introduced for.
+        """
+        from textual.widgets import Input
+
         result_holder: dict[str, object] = {}
 
         async def _push_modal() -> None:
@@ -1301,6 +1328,13 @@ class TestDirectoryPickerModal:
             )
 
         app.run_worker(_push_modal())
+        await wait_for(
+            pilot,
+            lambda: isinstance(app.screen, tui_actions.DirectoryPickerModal)
+            and bool(app.screen.query("#dir-path"))
+            and app.screen.query_one("#dir-path", Input).has_focus,
+            message="DirectoryPickerModal never mounted with its input focused",
+        )
         return result_holder
 
     async def test_nonexistent_path_is_rejected_in_place(
@@ -1310,8 +1344,7 @@ class TestDirectoryPickerModal:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            result_holder = await self._push(app, tmp_path)
-            await pilot.pause()
+            result_holder = await self._push(pilot, app, tmp_path)
 
             modal = app.screen
             bad_path = tmp_path / "does-not-exist"
@@ -1338,8 +1371,7 @@ class TestDirectoryPickerModal:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            result_holder = await self._push(app, tmp_path)
-            await pilot.pause()
+            result_holder = await self._push(pilot, app, tmp_path)
 
             modal = app.screen
             modal.query_one("#dir-path", Input).value = ""
@@ -1364,8 +1396,7 @@ class TestDirectoryPickerModal:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            result_holder = await self._push(app, tmp_path)
-            await pilot.pause()
+            result_holder = await self._push(pilot, app, tmp_path)
 
             modal = app.screen
             modal.query_one("#dir-path", Input).value = str(a_file)
@@ -1390,11 +1421,15 @@ class TestDirectoryPickerModal:
         sub = home / "project"
         sub.mkdir()
         monkeypatch.setenv("HOME", str(home))
+        # `_accept` expands via `os.path.expanduser`, and `ntpath.expanduser`
+        # reads `USERPROFILE` (falling back to `HOMEDRIVE`+`HOMEPATH`) rather
+        # than `HOME` on Windows -- both must be set for `~` to actually
+        # expand into `tmp_path` there (issue #486).
+        monkeypatch.setenv("USERPROFILE", str(home))
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            result_holder = await self._push(app, tmp_path)
-            await pilot.pause()
+            result_holder = await self._push(pilot, app, tmp_path)
 
             modal = app.screen
             modal.query_one("#dir-path", Input).value = "~/project"
@@ -1402,6 +1437,108 @@ class TestDirectoryPickerModal:
             await settle(pilot)
 
         assert result_holder["result"] == Path(os.path.abspath(sub))
+
+    async def test_tree_highlight_while_unfocused_leaves_the_input_alone(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The regression itself (issue #486): Textual posts a
+        ``NodeHighlighted`` for the tree's own root as soon as the
+        background ``DirectoryTree`` load lands, with no user interaction
+        at all. Posting the message directly (rather than waiting for the
+        real load) exercises the same bubbling path
+        ``on_tree_node_highlighted`` handles, deterministically."""
+        from textual.widgets import Input, Tree
+
+        other = tmp_path / "other"
+        other.mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await self._push(pilot, app, tmp_path)
+
+            modal = app.screen
+            tree = modal.query_one("#dir-tree", Tree)
+            assert not tree.has_focus
+
+            tree.root.data = DirEntry(path=other)
+            tree.post_message(Tree.NodeHighlighted(tree.root))
+            await pilot.pause()
+
+            assert modal.query_one("#dir-path", Input).value == str(tmp_path)
+
+            await pilot.press("escape")
+            await settle(pilot)
+
+    async def test_tree_highlight_while_focused_mirrors_into_the_input(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """The other half of the fix: a genuine highlight while the user is
+        actually browsing the tree must still mirror -- otherwise the fix
+        would just be "delete the handler."""
+        from textual.widgets import Input, Tree
+
+        other = tmp_path / "other"
+        other.mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await self._push(pilot, app, tmp_path)
+
+            modal = app.screen
+            tree = modal.query_one("#dir-tree", Tree)
+            tree.focus()
+            # `has_focus` is a reactive the tree only sets once it processes
+            # the `Focus` message `Screen.set_focus` posts, which is two
+            # message-pump hops after `focus()` -- one for the deferred
+            # `set_focus` callback, one for the event itself. Waiting on the
+            # condition rather than on one `pilot.pause()` is what keeps
+            # this off the "how fast is this machine" guess (see `_push`).
+            await wait_for(
+                pilot,
+                lambda: tree.has_focus,
+                message="the directory tree never took focus",
+            )
+
+            tree.root.data = DirEntry(path=other)
+            tree.post_message(Tree.NodeHighlighted(tree.root))
+            await pilot.pause()
+
+            assert modal.query_one("#dir-path", Input).value == str(other)
+
+            await pilot.press("escape")
+            await settle(pilot)
+
+    async def test_prefilled_input_survives_the_tree_loading(
+        self, fleet_env: Path, tmp_path: Path
+    ) -> None:
+        """Give the tree's root a child so this exercises a realistic load
+        rather than an empty directory; the automatic root highlight fires
+        either way."""
+        from textual.widgets import Input, Tree
+
+        # `current`'s parent must have children for the tree (rooted at the
+        # parent) to load anything and post the automatic root highlight.
+        current = tmp_path / "current"
+        current.mkdir()
+        (tmp_path / "sibling").mkdir()
+
+        app = FleetApp()
+        async with app.run_test() as pilot:
+            await self._push(pilot, app, current)
+
+            modal = app.screen
+            tree = modal.query_one("#dir-tree", Tree)
+            await wait_for(
+                pilot,
+                lambda: bool(tree.root.children),
+                message="tree never finished its background directory load",
+            )
+            await pilot.pause()
+
+            assert modal.query_one("#dir-path", Input).value == str(current)
+
+            await pilot.press("escape")
+            await settle(pilot)
 
     async def test_relative_input_resolves_against_current_directory(
         self, fleet_env: Path, tmp_path: Path
@@ -1422,8 +1559,7 @@ class TestDirectoryPickerModal:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            result_holder = await self._push(app, sibling_a)
-            await pilot.pause()
+            result_holder = await self._push(pilot, app, sibling_a)
 
             modal = app.screen
             modal.query_one("#dir-path", Input).value = "b"
@@ -1442,8 +1578,7 @@ class TestDirectoryPickerModal:
 
         app = FleetApp()
         async with app.run_test() as pilot:
-            result_holder = await self._push(app, tmp_path)
-            await pilot.pause()
+            result_holder = await self._push(pilot, app, tmp_path)
 
             modal = app.screen
             modal.query_one("#dir-path", Input).value = str(chosen)
@@ -1460,8 +1595,7 @@ class TestDirectoryPickerModal:
     async def test_escape_dismisses_with_none(self, fleet_env: Path, tmp_path: Path) -> None:
         app = FleetApp()
         async with app.run_test() as pilot:
-            result_holder = await self._push(app, tmp_path)
-            await pilot.pause()
+            result_holder = await self._push(pilot, app, tmp_path)
 
             await pilot.press("escape")
             await settle(pilot)

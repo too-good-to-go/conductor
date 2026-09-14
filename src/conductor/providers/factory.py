@@ -59,6 +59,8 @@ async def create_provider(
     timeout: float | None = None,
     max_session_seconds: float | None = None,
     max_agent_iterations: int | None = None,
+    idle_timeout_seconds: float | None = None,
+    max_idle_recovery_attempts: int | None = None,
     default_reasoning_effort: ReasoningEffort | None = None,
     default_context_tier: ContextTier | None = None,
     provider_settings: ProviderSettings | None = None,
@@ -83,6 +85,12 @@ async def create_provider(
         timeout: Request timeout in seconds.
         max_session_seconds: Maximum wall-clock duration for agent sessions.
         max_agent_iterations: Maximum tool-use iterations per agent execution.
+        idle_timeout_seconds: Time without SDK events before a Copilot session
+            is treated as idle. Copilot only; ``None`` uses the provider's
+            built-in default (90s).
+        max_idle_recovery_attempts: Maximum number of "please continue"
+            prompts sent to an idle Copilot session before failing. Copilot
+            only; ``None`` uses the provider's built-in default (5).
         default_reasoning_effort: Workflow-wide default reasoning effort
             (``low`` / ``medium`` / ``high`` / ``xhigh`` / ``max``) applied
             when an agent does not specify its own ``reasoning.effort``.
@@ -112,11 +120,18 @@ async def create_provider(
 
     match provider_type:
         case "copilot":
-            idle_recovery_config = None
-            if max_session_seconds is not None:
-                idle_recovery_config = IdleRecoveryConfig(
-                    max_session_seconds=max_session_seconds,
+            idle_recovery_overrides: dict[str, Any] = {
+                k: v
+                for k, v in (
+                    ("idle_timeout_seconds", idle_timeout_seconds),
+                    ("max_recovery_attempts", max_idle_recovery_attempts),
+                    ("max_session_seconds", max_session_seconds),
                 )
+                if v is not None
+            }
+            idle_recovery_config = (
+                IdleRecoveryConfig(**idle_recovery_overrides) if idle_recovery_overrides else None
+            )
             provider = CopilotProvider(
                 mcp_servers=mcp_servers,
                 model=default_model,
@@ -246,7 +261,12 @@ async def create_provider(
                 max_turns=max_agent_iterations,
                 max_session_seconds=max_session_seconds,
                 mcp_servers=mcp_servers,
-                setting_sources=getattr(provider_settings, "setting_sources", None),
+                setting_sources=(
+                    provider_settings.setting_sources
+                    if provider_settings is not None
+                    and provider_settings.name == "claude-agent-sdk"
+                    else None
+                ),
             )
         case "aca":
             if not AZURE_IDENTITY_AVAILABLE:
@@ -335,6 +355,8 @@ class ProviderFactory:
         timeout = getattr(runtime_config, "timeout", None)
         max_session_seconds = getattr(runtime_config, "max_session_seconds", None)
         max_agent_iterations = getattr(runtime_config, "max_agent_iterations", None)
+        idle_timeout_seconds = getattr(runtime_config, "idle_timeout_seconds", None)
+        max_idle_recovery_attempts = getattr(runtime_config, "max_idle_recovery_attempts", None)
         default_reasoning_effort = getattr(runtime_config, "default_reasoning_effort", None)
         default_context_tier = getattr(runtime_config, "default_context_tier", None)
         tool_output = getattr(runtime_config, "tool_output", None)
@@ -350,6 +372,8 @@ class ProviderFactory:
             timeout=timeout,
             max_session_seconds=max_session_seconds,
             max_agent_iterations=max_agent_iterations,
+            idle_timeout_seconds=idle_timeout_seconds,
+            max_idle_recovery_attempts=max_idle_recovery_attempts,
             default_reasoning_effort=default_reasoning_effort,
             default_context_tier=default_context_tier,
             provider_settings=provider_settings,

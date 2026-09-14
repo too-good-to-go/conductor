@@ -1,3 +1,4 @@
+# ruff: noqa: E501
 """GitHub Copilot SDK provider implementation.
 
 This module provides the CopilotProvider class for executing agents
@@ -13,6 +14,7 @@ import logging
 import math
 import os
 import random
+import subprocess
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -40,6 +42,7 @@ from conductor.providers.base import (
 from conductor.providers.capabilities import ProviderCapabilities
 from conductor.providers.context_tier import ContextTier, resolve_context_tier
 from conductor.providers.reasoning import ReasoningEffort, resolve_reasoning_effort
+from conductor.telemetry import guards
 
 if TYPE_CHECKING:
     from copilot.session import PermissionInvocation
@@ -57,6 +60,20 @@ logger = logging.getLogger(__name__)
 # ``get_model_pricing`` returns ``None`` and cost falls back to the static
 # table rather than emitting a confident-wrong number. See #265.
 _COPILOT_USD_PER_CREDIT: float = 0.01
+
+
+def _build_client_telemetry() -> dict[str, Any] | None:
+    # Provider registry lifetime is run-scoped; holding a registry across telemetry-state changes is not a supported embedding pattern.
+    if not guards.is_telemetry_active():
+        return None
+    protocol = guards.current_otlp_protocol()
+    if protocol not in {"http/protobuf", "http/json"}:
+        return None
+    return {
+        "otlp_endpoint": guards.current_otlp_endpoint(),
+        "otlp_protocol": protocol,
+        "capture_content": guards.capture_span_content(),
+    }
 
 
 def _is_finite_nonneg(value: object) -> TypeGuard[float]:
@@ -143,6 +160,39 @@ class RetryConfig:
     max_parse_recovery_attempts: int = 5
 
 
+# Cap on consecutive spawned-runtime restarts with no intervening successful
+# SDK call (issue #483). This is a death-loop guard, not a per-agent budget:
+# any successful agent-execution call resets the counter to 0 (see
+# ``_execute_with_retry``), so a long-running workflow that legitimately
+# restarts many times over hours is unaffected via that path — only a runtime
+# that dies again before ever succeeding trips the cap. Auxiliary paths that
+# also call ``_ensure_client_started`` (``validate_connection``,
+# ``execute_dialog_turn``, ``get_max_prompt_tokens``, ``get_model_pricing``,
+# ``list_models``, ``_validate_reasoning_effort_for_model``) can increment the
+# counter without resetting it on success.
+_MAX_CONSECUTIVE_RUNTIME_RESTARTS = 2
+
+
+def _is_broken_pipe_error(exc: BaseException) -> bool:
+    """Return True if ``exc`` or any exception in its cause/context chain is a
+    ``BrokenPipeError`` or ``ConnectionResetError``.
+
+    The Copilot SDK's JSON-RPC write path can wrap the underlying OS error in
+    another exception type depending on the transport mode, so a bare
+    ``isinstance`` check on the top-level exception is not sufficient — the
+    chain must be walked. Module-level and pure so it is unit-testable
+    without constructing a provider.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, (BrokenPipeError, ConnectionResetError)):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
 @dataclass
 class IdleRecoveryConfig:
     """Configuration for idle detection and recovery behavior.
@@ -153,7 +203,18 @@ class IdleRecoveryConfig:
 
     Attributes:
         idle_timeout_seconds: Time without any SDK events before considering session idle.
+            Settable via ``runtime.idle_timeout_seconds`` in workflow YAML (Copilot only).
+            The clock is suppressed entirely while a tool call is in flight (#488). The
+            SDK does not guarantee any events during a tool call — ``tool.execution_progress``
+            and ``tool.execution_partial_result`` exist in the SDK schema but are opt-in
+            per tool, so for most tool calls nothing arrives between
+            ``tool.execution_start`` and ``tool.execution_complete``. A stale clock in
+            that window therefore means the tool is still running, not that the session
+            is stuck. ``max_session_seconds`` is the sole backstop for a genuinely
+            wedged tool.
         max_recovery_attempts: Maximum number of "continue" messages to send before failing.
+            Settable via ``runtime.max_idle_recovery_attempts`` in workflow YAML
+            (Copilot only).
         max_session_seconds: Hard wall-clock limit on total session duration. Prevents
             sessions from hanging indefinitely even if non-idle events keep flowing.
         recovery_prompt: Template for the recovery message sent to stuck sessions.
@@ -168,6 +229,26 @@ class IdleRecoveryConfig:
         "Your last activity was: {last_activity}. "
         "Please continue with your task from where you left off."
     )
+
+    def __post_init__(self) -> None:
+        """Validate fields on direct construction.
+
+        The Pydantic bounds on the corresponding ``runtime.*`` schema fields
+        only guard the YAML path; ``CopilotProvider(idle_recovery_config=...)``
+        is a documented, directly-constructible path (used throughout the
+        test suite) that bypasses them entirely. Without this, an invalid
+        value like ``idle_timeout_seconds=0`` turns the new
+        tool-in-flight-suppression branch into an unbounded busy-wait for
+        the full ``max_session_seconds``.
+        """
+        if self.idle_timeout_seconds <= 0:
+            raise ValueError(f"idle_timeout_seconds must be > 0, got {self.idle_timeout_seconds}")
+        if self.max_recovery_attempts < 0:
+            raise ValueError(
+                f"max_recovery_attempts must be >= 0, got {self.max_recovery_attempts}"
+            )
+        if self.max_session_seconds <= 0:
+            raise ValueError(f"max_session_seconds must be > 0, got {self.max_session_seconds}")
 
 
 @dataclass
@@ -233,6 +314,8 @@ class CopilotProvider(AgentProvider):
         # Streaming events (``agent_message``, ``agent_tool_*``) fire
         # incrementally during execution.
         streaming_events=True,
+        # Per-run activation is carried by the ``native_otel_spans_active`` start-event field.
+        native_otel_spans=True,
         # ``agent_reasoning`` is emitted for thinking-equivalent content
         # from models that expose it (GPT-5 / o1 series).
         agent_reasoning_events=True,
@@ -271,6 +354,13 @@ class CopilotProvider(AgentProvider):
         # ``mcp_servers`` for MCP. The SDK's ``plugin_directories`` is
         # deliberately unused — see conductor.plugins for why.
         plugins=True,
+        # Reads the Copilot build's ``agents/*.agent.md`` convention (issue
+        # #497). Only breaks ties where a genuine choice exists — parsing
+        # always follows whichever manifest convention actually matched.
+        plugin_flavor="copilot",
+        # ``runtime.idle_timeout_seconds`` / ``runtime.max_idle_recovery_attempts``
+        # tune the IdleRecoveryConfig-backed watchdog (#488).
+        idle_recovery=True,
         max_temperature=1.0,
         upstream_pin=None,
         maintainer="@microsoft/conductor",
@@ -385,6 +475,13 @@ class CopilotProvider(AgentProvider):
         self._mcp_servers = mcp_servers or {}
         self._started = False
         self._start_lock = asyncio.Lock()
+        # Consecutive spawned-runtime restarts with no intervening successful
+        # SDK call. Reset to 0 on every successful call in
+        # ``_execute_with_retry``; see ``_MAX_CONSECUTIVE_RUNTIME_RESTARTS``.
+        self._consecutive_runtime_restarts = 0
+        # Guards a one-time warning when a spawned, started client has no
+        # ``_cli_process`` handle (see ``_spawned_runtime_process``).
+        self._warned_missing_runtime_handle = False
         self._idle_recovery_config = idle_recovery_config or IdleRecoveryConfig()
         self._temperature = temperature
         self._default_max_agent_iterations = max_agent_iterations
@@ -400,6 +497,12 @@ class CopilotProvider(AgentProvider):
         self._provider_settings = provider_settings
         self._tool_output_config = tool_output or ToolOutputConfig()
         self._github_token = github_token
+        # Warn-once latch for extended idle-recovery suppression while a
+        # tool call is in flight (#488) — mirrors the
+        # `_pricing_hook_failed_warned` / `_context_window_anomaly_warned`
+        # pattern in engine/workflow.py: "a debug-only record would never
+        # reach an operator."
+        self._tool_suppression_warned = False
         self._warn_custom_routing_default_model()
 
     @staticmethod
@@ -741,12 +844,14 @@ class CopilotProvider(AgentProvider):
         agent: AgentDef,
         context: dict[str, Any],
         rendered_prompt: str,
+        *,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Execute an agent using the Copilot SDK.
 
@@ -773,6 +878,11 @@ class CopilotProvider(AgentProvider):
             extra_mcp_servers: Optional MCP servers contributed by the
                 agent's effective ``plugins:``, merged on top of the
                 workflow's own ``runtime.mcp_servers`` for this call.
+            continuation_state: Ignored. Copilot has no in-memory
+                continuation surface (``supports_continuation`` is
+                ``False``), so it never populates
+                ``AgentOutput.continuation_state`` and is never handed one
+                back.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -780,6 +890,7 @@ class CopilotProvider(AgentProvider):
         Raises:
             ProviderError: If execution fails after all retry attempts.
         """
+        del continuation_state  # No continuation surface (see docstring).
         # Record the call for testing purposes
         self._call_history.append(
             {
@@ -898,6 +1009,11 @@ class CopilotProvider(AgentProvider):
                     custom_agents=custom_agents,
                     extra_mcp_servers=extra_mcp_servers,
                 )
+                # A successful SDK call resets the consecutive-restart budget
+                # (issue #483, Q2): the counter only bounds a death loop where
+                # the runtime dies again before ever succeeding, not restarts
+                # spread across a long, otherwise-healthy run.
+                self._consecutive_runtime_restarts = 0
                 # Extract usage data from SDK response if available
                 input_tokens = sdk_response.input_tokens if sdk_response else None
                 output_tokens = sdk_response.output_tokens if sdk_response else None
@@ -1484,9 +1600,21 @@ class CopilotProvider(AgentProvider):
             finally:
                 # Disconnect session unless it was kept alive for follow-up
                 if not session_destroyed:
-                    await session.disconnect()
+                    try:
+                        await session.disconnect()
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.warning(
+                            "Failed to disconnect Copilot session for agent '%s' during "
+                            "cleanup; continuing.",
+                            agent.name,
+                            exc_info=True,
+                        )
 
-        except ProviderError:
+        except ProviderError as e:
+            if e.is_retryable and self._runtime_is_dead():
+                raise self._runtime_unavailable_error(e) from e
             raise
         except ValidationError:
             # Deterministic failures: a configuration error (e.g. unsupported
@@ -1495,7 +1623,11 @@ class CopilotProvider(AgentProvider):
             # the agent, so surface unwrapped rather than letting the retry
             # loop mask it.
             raise
+        except (BrokenPipeError, ConnectionResetError) as e:
+            raise self._runtime_unavailable_error(e) from e
         except Exception as e:
+            if _is_broken_pipe_error(e):
+                raise self._runtime_unavailable_error(e) from e
             raise ProviderError(
                 f"Copilot SDK call failed: {e}",
                 suggestion="Check that copilot CLI is installed and authenticated",
@@ -1572,6 +1704,13 @@ class CopilotProvider(AgentProvider):
 
         # Mutable container for tool iteration counting
         tool_iteration_ref: list[int] = [0]
+
+        # In-flight tool calls, keyed by tool_call_id (falling back to the
+        # tool name when no id is available). A non-empty dict here means a
+        # tool is genuinely still running, not that the session is stuck
+        # (#488) — see IdleRecoveryConfig.idle_timeout_seconds docstring for
+        # why a stale clock isn't reliable here.
+        active_tools: dict[str, str] = {}
 
         def on_event(event: Any) -> None:
             nonlocal response_content, error_message
@@ -1654,6 +1793,35 @@ class CopilotProvider(AgentProvider):
                 last_activity_ref[1] = tool_name
                 # Count tool-use iterations
                 tool_iteration_ref[0] += 1
+                # Record the in-flight call so idle detection can tell "the
+                # tool is still running" from "the session is stuck" (#488).
+                # tool_call_id is a required field on real SDK events, but
+                # tests exercise this with Mock objects where getattr always
+                # succeeds without returning a string — guard with isinstance
+                # rather than trusting the attribute is present and usable.
+                tool_call_id = getattr(event.data, "tool_call_id", None)
+                key = tool_call_id if isinstance(tool_call_id, str) else str(tool_name)
+                active_tools[key] = str(tool_name)
+            elif event_type == "tool.execution_complete":
+                tool_call_id = getattr(event.data, "tool_call_id", None)
+                key = tool_call_id if isinstance(tool_call_id, str) else None
+                if key is not None and key in active_tools:
+                    active_tools.pop(key, None)
+                elif isinstance(tool_call_id, str):
+                    # Unrecognized tool_call_id (duplicate or unmatched
+                    # completion event — this SDK re-delivers events, see
+                    # seen_call_ids above). Do NOT guess which in-flight
+                    # entry to evict: popping the wrong one would re-arm the
+                    # idle watchdog while a different tool is still running,
+                    # reproducing #488. Leaving a stale entry is safe because
+                    # max_session_seconds backstops it.
+                    logger.debug(
+                        "tool.execution_complete for untracked tool_call_id %r — "
+                        "ignoring; in-flight: %s",
+                        tool_call_id,
+                        sorted(active_tools),
+                    )
+                last_activity_ref[1] = next(iter(active_tools.values()), None)
 
             # Forward structured events upstream via event_callback
             if event_callback is not None:
@@ -1686,6 +1854,7 @@ class CopilotProvider(AgentProvider):
             max_agent_iterations=max_agent_iterations,
             interrupt_signal=interrupt_signal,
             agent_name=agent_name,
+            active_tools_ref=active_tools,
         )
         if was_interrupted:
             # Return partial content (don't check error_message for partial)
@@ -2120,6 +2289,7 @@ class CopilotProvider(AgentProvider):
         elif last_event_type:
             activity_map = {
                 "tool.execution_start": "starting a tool call",
+                "tool.execution_complete": "finishing a tool call",
                 "assistant.reasoning": "reasoning about the problem",
                 "assistant.turn_start": "beginning a response",
                 "assistant.message": "sending a message",
@@ -2190,6 +2360,47 @@ class CopilotProvider(AgentProvider):
 
         console.print(text)
 
+    def _log_tool_suppression_warning(
+        self,
+        in_flight_tools: str,
+        elapsed: float,
+        max_session: float,
+        agent_name: str | None = None,
+    ) -> None:
+        """Log the first occurrence of idle-recovery suppression to the console.
+
+        Mirrors ``_log_recovery_attempt``'s console output, but distinct from
+        it: this fires once per provider lifetime (see
+        ``_tool_suppression_warned``) rather than per recovery attempt, since
+        a genuinely long tool call can suppress idle recovery for many idle
+        windows in a row and a repeated console line would just be noise.
+
+        Args:
+            in_flight_tools: Comma-joined names of the currently in-flight tools.
+            elapsed: Seconds the session has been running so far.
+            max_session: The wall-clock session limit that still applies.
+            agent_name: Optional agent identifier for attribution.
+        """
+        from rich.text import Text
+
+        from conductor.console import make_console
+
+        console = make_console(stderr=True, highlight=False)
+
+        text = Text()
+        text.append("    ├─ ", style="dim")
+        if agent_name:
+            text.append(f"[{agent_name}] ", style="magenta")
+        text.append("⚠️ ", style="yellow")
+        text.append("Idle recovery suppressed", style="yellow bold")
+        text.append(
+            f" - tool(s) in flight: '{in_flight_tools}', running {elapsed:.0f}s, "
+            f"will hard-fail at max_session_seconds={max_session:.0f}s",
+            style="dim italic",
+        )
+
+        console.print(text)
+
     async def _wait_with_idle_detection(
         self,
         done: asyncio.Event,
@@ -2202,6 +2413,7 @@ class CopilotProvider(AgentProvider):
         max_agent_iterations: int | None = None,
         interrupt_signal: asyncio.Event | None = None,
         agent_name: str | None = None,
+        active_tools_ref: dict[str, str] | None = None,
     ) -> bool:
         """Wait for session completion with idle detection, recovery, and optional interrupt.
 
@@ -2209,8 +2421,12 @@ class CopilotProvider(AgentProvider):
         with interrupt support (aborting on user request). When the model is
         actively working (SDK events flowing), the idle timer continuously
         resets — so stuck-detection is suppressed while the model is actively
-        working. The interrupt signal, however, is always raced regardless of
-        activity.
+        working. It is also suppressed while any tool call is in flight
+        (``active_tools_ref`` non-empty): a stale idle clock during a
+        long-running tool call means the tool is still running, not that the
+        session is stuck (#488; see ``IdleRecoveryConfig.idle_timeout_seconds``
+        docstring for why events can't be relied on during a tool call). The
+        interrupt signal, however, is always raced regardless of activity.
 
         Args:
             done: Event that signals session completion.
@@ -2230,6 +2446,11 @@ class CopilotProvider(AgentProvider):
                 logging so that idle-recovery messages emitted from concurrent
                 for-each or parallel iterations can be attributed to a specific
                 agent. ``None`` means no attribution tag.
+            active_tools_ref: Mutable dict of in-flight tool calls (id -> tool
+                name). A non-empty dict suppresses idle recovery entirely
+                (see ``IdleRecoveryConfig.idle_timeout_seconds`` docstring).
+                ``None`` (the default) preserves the pre-#488 behaviour of
+                every existing caller.
 
         Returns:
             True if interrupted, False if completed normally.
@@ -2330,6 +2551,51 @@ class CopilotProvider(AgentProvider):
                     return False  # Completed successfully
 
             except TimeoutError as e:
+                # Timeout fired — but check if a tool call is still in
+                # flight first. The SDK does not guarantee any events during
+                # a tool call — tool.execution_progress and
+                # tool.execution_partial_result exist in the schema but are
+                # opt-in per tool, so for most tool calls nothing arrives
+                # between start and complete (see IdleRecoveryConfig
+                # docstring). A stale idle clock here therefore means the
+                # tool is still running (#488), not that the session is
+                # stuck. max_session_seconds (checked at the top of this
+                # loop) is the sole backstop for a genuinely wedged tool —
+                # max_agent_iterations cannot help, since its counter only
+                # advances on a new tool.execution_start and is frozen for
+                # the entire duration of a wedge.
+                if active_tools_ref:
+                    logger.debug(
+                        "Idle timeout reached while tool(s) in flight%s: %s — suppressing "
+                        "idle recovery",
+                        f" agent={agent_name}" if agent_name else "",
+                        ", ".join(active_tools_ref.values()),
+                    )
+                    if not self._tool_suppression_warned:
+                        self._tool_suppression_warned = True
+                        logger.warning(
+                            "Idle recovery suppressed while tool(s) in flight%s: %s. "
+                            "Suppression has been in effect for %.0fs; if the tool(s) "
+                            "are genuinely stuck, the session will hard-fail once "
+                            "max_session_seconds (%.0fs) is exceeded. Further "
+                            "occurrences are logged at debug level.",
+                            f" agent={agent_name}" if agent_name else "",
+                            ", ".join(active_tools_ref.values()),
+                            elapsed,
+                            max_session,
+                        )
+                        if verbose_enabled:
+                            self._log_tool_suppression_warning(
+                                in_flight_tools=", ".join(active_tools_ref.values()),
+                                elapsed=elapsed,
+                                max_session=max_session,
+                                agent_name=agent_name,
+                            )
+                    recovery_attempts = 0
+                    if not done.is_set():
+                        done.clear()
+                    continue
+
                 # Timeout fired — but check if events were recently received.
                 # The agent may be actively working (tool calls, reasoning) without
                 # having reached session.idle yet. Only consider it stuck if no
@@ -2382,6 +2648,15 @@ class CopilotProvider(AgentProvider):
 
                 # Send recovery message
                 recovery_prompt = self._build_recovery_prompt(last_event_type, last_tool_call)
+                if self._runtime_is_dead():
+                    # The runtime died between the last activity and this
+                    # recovery attempt (issue #483 root cause #3): without
+                    # this check the dead process would burn every recovery
+                    # attempt and eventually be reported as a stuck *agent*
+                    # rather than a dead *process*.
+                    raise self._runtime_unavailable_error(
+                        RuntimeError("Copilot runtime process is not running")
+                    ) from None
                 await session.send(recovery_prompt)
 
                 # Reset the done event to wait again — but only if it hasn't
@@ -2395,6 +2670,12 @@ class CopilotProvider(AgentProvider):
         Uses a lock to prevent concurrent agents (parallel groups or
         for-each iterations) from racing to start the same client
         subprocess multiple times.
+
+        Also detects a spawned runtime that has died (issue #483) and
+        rebuilds the client before returning. This check runs inside the
+        lock, so it double-checks correctly under concurrency: the first
+        waiter to observe a dead runtime rebuilds it, and any waiter that
+        arrives after that rebuild sees a live child and does nothing.
         """
         async with self._start_lock:
             if self._client is None:
@@ -2407,6 +2688,176 @@ class CopilotProvider(AgentProvider):
                 # BlockingIOError on large payloads. The asyncio event loop
                 # may set O_NONBLOCK on inherited file descriptors.
                 self._fix_pipe_blocking_mode()
+            elif self._runtime_is_dead():
+                await self._restart_spawned_runtime()
+
+    def _spawned_runtime_process(self) -> subprocess.Popen[bytes] | None:
+        """Return the subprocess this provider owns and spawned, else None.
+
+        Returns ``None`` (rather than guessing) for every mode where this
+        provider does not own the runtime's lifecycle:
+
+        - An externally-owned runtime (``runtime_url`` /
+          ``COPILOT_PROVIDER_RUNTIME_URL``) — Conductor's own authoritative
+          gate, preferred over the SDK-private ``_is_external_server``.
+        - No client constructed yet.
+        - The SDK's in-process FFI runtime mode, which has no OS child
+          process (``_cli_process`` absent, or not a real
+          ``subprocess.Popen``). The ``isinstance`` check also protects test
+          doubles that stand in for the client without a real subprocess —
+          only a genuine spawned-runtime handle is ever treated as live.
+        """
+        if self._resolve_runtime_connection() is not None:
+            return None
+        if self._client is None:
+            return None
+        # ``_cli_process`` is the spawned-child handle (a real OS process,
+        # None for URI and FFI connections). This is deliberately distinct
+        # from ``_fix_pipe_blocking_mode``'s ``_process``, which is the
+        # transport handle instead (a ``SocketWrapper`` in TCP mode, an
+        # ``_FfiProcessAdapter`` with its own ``poll()`` in FFI mode) --
+        # unifying the two reads onto ``_process`` would make FFI mode look
+        # like a killable child process.
+        process = getattr(self._client, "_cli_process", None)
+        if not isinstance(process, subprocess.Popen):
+            # We spawned something (not external, client built and started),
+            # so a handle should exist. The one benign explanation is FFI
+            # in-process mode, which has no OS child process at all; anything
+            # else here is a capability regression (e.g. an SDK rename of
+            # ``_cli_process``) that would otherwise silently disable
+            # dead-runtime recovery with no diagnostic.
+            if self._started and not self._warned_missing_runtime_handle:
+                self._warned_missing_runtime_handle = True
+                logger.warning(
+                    "Spawned Copilot runtime has no usable _cli_process handle. "
+                    "This is expected in FFI in-process mode; otherwise it may "
+                    "indicate an incompatible Copilot SDK version, which would "
+                    "silently disable dead-runtime restart recovery (issue #483)."
+                )
+            return None
+        return process
+
+    def _runtime_is_dead(self) -> bool:
+        """Return True only when a spawned runtime's child process has exited.
+
+        Returns False ("not known dead") for external runtimes, in-process
+        FFI mode, and a client that has not started yet, so no non-spawned
+        mode can ever trigger a restart.
+        """
+        process = self._spawned_runtime_process()
+        return process is not None and process.poll() is not None
+
+    def _runtime_unavailable_error(self, exc: BaseException) -> ProviderError:
+        """Build the error for a dead/unreachable Copilot runtime.
+
+        Forks on whether this provider connects to an externally-owned
+        runtime or spawns its own (issue #483, Q1): a broken connection to
+        an external runtime is never retried or respawned here — the
+        orchestrator that owns it is responsible for health checks and
+        restarts (docs/configuration.md). A broken connection to a runtime
+        this provider spawned is retryable: the next attempt's
+        ``_ensure_client_started`` will rebuild it.
+        """
+        connection = self._resolve_runtime_connection()
+        if connection is not None:
+            url, _token = connection
+            return ProviderError(
+                f"The external Copilot runtime at {url} is unreachable (broken connection).",
+                suggestion=(
+                    "This runtime is owned by an external orchestrator, which is "
+                    "responsible for its health checks and restarts. Verify the "
+                    "runtime process is still running and reachable at that address."
+                ),
+                is_retryable=False,
+            )
+
+        process = self._spawned_runtime_process()
+        exit_code = process.poll() if process is not None else None
+        if exit_code is not None:
+            return ProviderError(
+                f"The Copilot runtime process died (exit code {exit_code}): {exc}",
+                suggestion=(
+                    "The nested Copilot runtime will be restarted automatically on the "
+                    "next attempt. If this recurs, it may indicate the runtime process "
+                    "is running out of memory; try setting "
+                    'NODE_OPTIONS="--max-old-space-size=8192" in the environment running '
+                    "conductor."
+                ),
+                is_retryable=True,
+            )
+
+        return ProviderError(
+            f"The connection to the Copilot runtime broke: {exc}",
+            suggestion=(
+                "The runtime process is still running, so this was a transport "
+                "failure rather than a crash. The connection will be re-established "
+                "automatically on the next attempt."
+            ),
+            is_retryable=True,
+        )
+
+    async def _restart_spawned_runtime(self) -> None:
+        """Rebuild the Copilot client after detecting a dead spawned runtime.
+
+        Must be called while holding ``self._start_lock``. Checks the
+        consecutive-restart cap (reset on any successful SDK call, see
+        ``_execute_with_retry``) before incrementing it and fails fast if a
+        runtime keeps dying before ever succeeding, rather than looping
+        forever.
+        """
+        if self._consecutive_runtime_restarts >= _MAX_CONSECUTIVE_RUNTIME_RESTARTS:
+            raise ProviderError(
+                "The Copilot runtime process died and was restarted "
+                f"{_MAX_CONSECUTIVE_RUNTIME_RESTARTS} times in a row without a "
+                "single successful call. Giving up rather than restarting again.",
+                suggestion=(
+                    "Check the runtime for a crash loop (e.g. persistent OOM). Try "
+                    'setting NODE_OPTIONS="--max-old-space-size=8192" in the '
+                    "environment running conductor."
+                ),
+                is_retryable=False,
+            )
+
+        self._consecutive_runtime_restarts += 1
+
+        old_process = self._spawned_runtime_process()
+        old_exit_code = old_process.poll() if old_process is not None else None
+        logger.warning(
+            "Copilot runtime process died (exit code %s); restarting it "
+            "(consecutive restart %d/%d).",
+            old_exit_code,
+            self._consecutive_runtime_restarts,
+            _MAX_CONSECUTIVE_RUNTIME_RESTARTS,
+        )
+
+        # Best-effort teardown of the dead client. stop() attempts a graceful
+        # RPC shutdown plus process-exit waits against a corpse, so it is
+        # bounded rather than allowed to hang recovery. Failures are logged
+        # rather than silently swallowed: a StopError here means a runtime
+        # child survived both terminate and kill, i.e. a leaked process.
+        try:
+            await asyncio.wait_for(self._client.stop(), timeout=10.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning(
+                "Teardown of the dead Copilot client failed; continuing with the "
+                "restart. A runtime child process may have been leaked.",
+                exc_info=True,
+            )
+
+        # Invalidate the old client before rebuilding: if the new client's
+        # start() raises (e.g. OOM at spawn), we must not be left believing
+        # a never-started client is started, which would silently skip
+        # recovery on the next call.
+        self._client = None
+        self._started = False
+
+        new_client = self._build_client()
+        await new_client.start()
+        self._client = new_client
+        self._started = True
+        self._fix_pipe_blocking_mode()
 
     def _build_client(self) -> Any:
         """Construct the Copilot SDK client.
@@ -2419,9 +2870,9 @@ class CopilotProvider(AgentProvider):
         reuses the authenticated runtime process while creating a separate SDK
         session for each agent.
 
-        Otherwise a nested runtime is spawned via a plain, argument-free
-        ``CopilotClient()``. A ``github_token`` supplied at construction is
-        deliberately *not* passed here: the SDK's constructor-level
+        Otherwise a nested runtime is spawned via ``CopilotClient()`` with
+        optional HTTP OTLP telemetry. A ``github_token`` supplied at
+        construction is deliberately *not* passed here: the SDK's constructor-level
         ``github_token`` is exported to the spawned runtime as a
         ``COPILOT_SDK_AUTH_TOKEN`` environment variable, not delivered
         in-memory. Instead, the token is forwarded per-session via
@@ -2433,6 +2884,20 @@ class CopilotProvider(AgentProvider):
         """
         connection = self._resolve_runtime_connection()
         if connection is None:
+            telemetry = _build_client_telemetry()
+            if telemetry is not None:
+                return CopilotClient(
+                    telemetry={
+                        "otlp_endpoint": telemetry["otlp_endpoint"],
+                        "otlp_protocol": telemetry["otlp_protocol"],
+                        "capture_content": telemetry["capture_content"],
+                    }
+                )
+            if guards.is_telemetry_active() and guards.warn_copilot_grpc_once():
+                logger.warning(
+                    "Copilot native OpenTelemetry spans require HTTP OTLP; set "
+                    "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf."
+                )
             return CopilotClient()
 
         url, token = connection
@@ -2760,6 +3225,7 @@ class CopilotProvider(AgentProvider):
                 await self._client.stop()
         self._client = None
         self._started = False
+        self._consecutive_runtime_restarts = 0
         self._call_history.clear()
         self._retry_history.clear()
 
@@ -2799,6 +3265,24 @@ class CopilotProvider(AgentProvider):
         info = by_id[matched_id]
         limits = getattr(info.capabilities, "limits", None)
         return getattr(limits, "max_prompt_tokens", None)
+
+    async def get_max_output_tokens(self, model: str) -> int | None:
+        """Return the Copilot SDK's ``max_output_tokens`` for ``model``.
+
+        Implements the :meth:`AgentProvider.get_max_output_tokens` hook by
+        delegating to :meth:`get_model_capabilities`, which reads
+        ``capabilities.limits.max_output_tokens`` off the same
+        ``client.list_models()`` entry. Compaction uses this to reserve
+        headroom for the model's own answer.
+
+        Returns ``None`` in mock-handler mode, when the SDK is unavailable,
+        when no match is found, or when the SDK call fails — context-window
+        metadata must never block workflow execution.
+        """
+        capabilities = await self.get_model_capabilities(model)
+        if capabilities is None:
+            return None
+        return capabilities.max_output_tokens
 
     async def get_model_pricing(self, model: str) -> ModelPricing | None:
         """Derive per-token USD pricing for ``model`` from the SDK billing data.

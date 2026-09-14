@@ -108,7 +108,6 @@ For runtime config, context modes, limits, and cost tracking, see [references/au
 | `human_gate` | Pauses for user decision with options (Markdown + auto-linkified paths/URLs) |
 | `dialog` | Per-agent trigger for conditional multi-turn conversation with the user |
 | `retry` | Per-agent retry policy for transient `provider_error` / `timeout` failures |
-| `hooks` | Workflow lifecycle expressions: `on_start`, `on_complete`, `on_error` |
 | `metadata` | Arbitrary YAML or `--metadata`/`-m` key-values surfaced in `workflow_started` events |
 | `instructions` | Workflow-level workspace context (inline strings or `!file` includes) prepended to every prompt |
 | `--workspace-instructions` | CLI flag to auto-discover AGENTS.md / CLAUDE.md / `.github/copilot-instructions.md` / `.github/instructions/**/*.instructions.md` (only `applyTo: "**"` files) |
@@ -117,7 +116,7 @@ For runtime config, context modes, limits, and cost tracking, see [references/au
 | `limits` | Safety bounds (max_iterations up to 500, timeout_seconds) |
 | `timeout_seconds` (agent) | Hard wall-clock cancellation per agent (provider-backed agents only) |
 | `cost` | Token usage and cost tracking configuration |
-| `runtime` | Provider (`copilot`, `claude`, `claude-agent-sdk`, `hermes`, `openai-agents`), model, temperature, max_tokens, reasoning effort, MCP servers |
+| `runtime` | Provider (`copilot`, `claude`, `claude-agent-sdk`, `hermes`, `openai`), model, temperature, max_tokens, reasoning effort, MCP servers |
 | `--web` | Real-time web dashboard with DAG graph, live streaming, in-browser human gates, sub-workflow dive-in, replay |
 | `checkpoint` | Auto-saved on failure; resume with `conductor resume` (run-flag parity: `--provider`, `--metadata`, `--web`, `--web-bg`, `--web-port`) |
 | `registry` | Named workflow sources (GitHub repo or local dir); refs accept `name@registry@version` and `workflow#ref` (tag/branch/SHA) |

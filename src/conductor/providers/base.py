@@ -181,6 +181,17 @@ class AgentOutput:
     """Sandbox wall-clock time reported by a remote-runtime provider (issue #284,
     FR7). ``None`` for providers with no distinct sandbox time to report."""
 
+    continuation_state: object | None = None
+    """Provider-specific state for continuing this completed execution in memory.
+
+    Populated only by providers that declare
+    :attr:`AgentProvider.supports_continuation`; every other provider leaves
+    it ``None``, the first-class "rebuild the prompt statelessly" signal the
+    executor branches on. The value is provider-opaque: it must never be
+    handed to a different provider, and it is in-memory only — it is never
+    serialized to checkpoints or event logs.
+    """
+
 
 @dataclass(frozen=True)
 class ModelCapabilityInfo:
@@ -342,6 +353,26 @@ class AgentProvider(ABC):
         """
         return False
 
+    @property
+    def supports_continuation(self) -> bool:
+        """Whether the provider can resume a completed execution in memory.
+
+        When ``True``, a completed :meth:`execute` returns provider-opaque
+        state on :attr:`AgentOutput.continuation_state`, and handing that
+        state back to :meth:`execute` continues the completed conversation
+        with ``rendered_prompt`` as the next user turn. On that path the
+        :class:`~conductor.executor.agent.AgentExecutor` skips prompt
+        rendering entirely — the task, the workspace-instructions
+        preamble, and the eager skill injection all live in the
+        provider-held conversation already — so it refuses to discard the
+        rendered prompt unless the provider declares this property.
+
+        When ``False`` (default), the provider must leave
+        :attr:`AgentOutput.continuation_state` at ``None``; a follow-up
+        run then gets a freshly rebuilt prompt instead.
+        """
+        return False
+
     def __init_subclass__(cls, *, abstract: bool = False, **kwargs: Any) -> None:
         """Enforce that a production subclass declares what it can honour.
 
@@ -412,12 +443,14 @@ class AgentProvider(ABC):
         agent: AgentDef,
         context: dict[str, Any],
         rendered_prompt: str,
+        *,
         tools: list[str] | None = None,
         interrupt_signal: asyncio.Event | None = None,
         event_callback: EventCallback | None = None,
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: object | None = None,
     ) -> AgentOutput:
         """Execute an agent and return normalized output.
 
@@ -455,6 +488,12 @@ class AgentProvider(ABC):
                 only. Per-call rather than per-provider because
                 ``plugins:`` is a per-agent field and providers are
                 cached per type.
+            continuation_state: Optional provider-specific state from a
+                completed execution. Providers that declare
+                :attr:`supports_continuation` resume it with
+                ``rendered_prompt`` as the next user turn; every other
+                provider ignores it and leaves
+                :attr:`AgentOutput.continuation_state` at ``None``.
 
         Returns:
             Normalized AgentOutput with structured content.
@@ -542,6 +581,32 @@ class AgentProvider(ABC):
 
         Returns:
             The maximum prompt (input) tokens the SDK will accept, or ``None``.
+        """
+        return None
+
+    async def get_max_output_tokens(self, model: str) -> int | None:
+        """Return the SDK-reported maximum output (completion) tokens for ``model``.
+
+        This is the provider's output cap for a single response. It is used by
+        compaction to reserve enough headroom in the context window for the
+        model's own answer.
+
+        Implementations should:
+
+        * Query their SDK's model-listing endpoint (cached after the first call).
+        * Return ``None`` when the model is unknown to the provider, when the
+          SDK call fails, or when no metadata is available.
+        * Never raise — context-window metadata is best-effort and must not
+          interrupt workflow execution.
+
+        The default implementation returns ``None``.
+
+        Args:
+            model: The model identifier as it would be sent to the SDK
+                (e.g. ``"gpt-5.2"``, ``"claude-sonnet-4-5-20250929"``).
+
+        Returns:
+            The maximum output tokens the SDK will accept, or ``None``.
         """
         return None
 

@@ -887,6 +887,7 @@ class _StubProvider(AgentProvider, abstract=True):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         return AgentOutput(content={"answer": "ok"}, raw_response="")
 
@@ -895,6 +896,60 @@ class _StubProvider(AgentProvider, abstract=True):
 
     async def close(self) -> None:
         return None
+
+
+class TestSettingsDirCapabilityRejection:
+    """``capabilities.settings_dir=False`` must hold at run time too.
+
+    ``conductor run`` never calls the static validator, and the engine
+    renders, absolutizes and existence-checks the directory for *every*
+    provider -- so an author saw the field processed and then handed to a
+    provider that never reads it. The agent answered from whatever
+    conventions its cwd supplied and the run exited 0, which is the
+    silent-wrong-answer case the capability exists to prevent. Mirrors
+    :class:`TestSessionKeyCapabilityRejection`, and the four ``_reject_*``
+    helpers that exist for the same reason.
+    """
+
+    @staticmethod
+    def _agent(tmp_path) -> AgentDef:
+        return AgentDef(name="review", prompt="hi", settings_dir=str(tmp_path))
+
+    @staticmethod
+    def _copilot(calls: list[str] | None = None) -> CopilotProvider:
+        def mock_handler(agent, prompt, context):
+            if calls is not None:
+                calls.append(agent.name)
+            return {"answer": "x"}
+
+        return CopilotProvider(mock_handler=mock_handler)
+
+    @pytest.mark.asyncio
+    async def test_provider_that_cannot_apply_it_is_refused(self, tmp_path) -> None:
+        assert CopilotProvider.CAPABILITIES.settings_dir is False
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await AgentExecutor(self._copilot()).execute(self._agent(tmp_path), {})
+
+        assert "does not apply it" in str(exc_info.value)
+        assert exc_info.value.agent_name == "review"
+
+    @pytest.mark.asyncio
+    async def test_the_refusal_precedes_the_provider_call(self, tmp_path) -> None:
+        """An answer from the wrong repository's conventions is worse than none."""
+        calls: list[str] = []
+        with pytest.raises(ExecutionError):
+            await AgentExecutor(self._copilot(calls)).execute(self._agent(tmp_path), {})
+
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_an_agent_without_settings_dir_is_untouched(self) -> None:
+        output = await AgentExecutor(self._copilot()).execute(
+            AgentDef(name="review", prompt="hi"), {}
+        )
+
+        assert output.content == {"answer": "x"}
 
 
 class TestSessionKeyCapabilityRejection:
@@ -1051,3 +1106,84 @@ class TestAgentExecutorNonDictContentPreservesUsage:
         assert output.output_tokens == 30
         assert output.last_call_input_tokens == 45
         assert output.tokens_used == 90
+
+
+class TestContinuationState:
+    """Continuation state may only discard the rendered prompt when the
+    provider declares it can resume that state (``supports_continuation``)."""
+
+    @pytest.mark.asyncio
+    async def test_continuation_rejected_when_provider_cannot_resume(self) -> None:
+        # Requirement: a provider handed continuation state it cannot resume
+        # must fail loudly — continuing would send the model only the
+        # follow-up turn, with no task prompt and no history.
+        provider = CopilotProvider(mock_handler=lambda a, p, c: {"answer": "x"})
+        executor = AgentExecutor(provider)
+        agent = AgentDef(name="test", model="gpt-4", prompt="Do work", output=None)
+
+        with pytest.raises(ExecutionError, match="cannot resume"):
+            await executor.execute(
+                agent, {}, guidance_section="## Validation feedback", continuation_state=["turn"]
+            )
+
+    @pytest.mark.asyncio
+    async def test_continuation_sends_only_the_follow_up_turn(self) -> None:
+        # Requirement: on the continuation path the prompt template, the
+        # workspace-instructions preamble and the guidance append are all
+        # skipped — the provider-held conversation already contains them, so
+        # the follow-up turn is the entire prompt.
+        captured: dict[str, Any] = {}
+
+        class _CapableProvider(CopilotProvider, abstract=True):
+            @property
+            def supports_continuation(self) -> bool:
+                return True
+
+        provider = _CapableProvider(mock_handler=lambda a, p, c: {})
+
+        async def exec_fn(
+            *, agent: AgentDef, rendered_prompt: str, continuation_state: Any = None, **kw: Any
+        ) -> AgentOutput:
+            captured["prompt"] = rendered_prompt
+            captured["state"] = continuation_state
+            return AgentOutput(content={"result": "ok"}, raw_response="")
+
+        provider.execute = exec_fn  # type: ignore[method-assign]
+        executor = AgentExecutor(provider, instructions_preamble="WORKSPACE INSTRUCTIONS\n")
+        agent = AgentDef(
+            name="test", model="gpt-4", prompt="Do {{ workflow.input.x }}", output=None
+        )
+        sentinel = object()
+        emitted: list[dict[str, Any]] = []
+
+        await executor.execute(
+            agent,
+            {"workflow": {"input": {"x": "things"}}},
+            guidance_section="FEEDBACK",
+            continuation_state=sentinel,
+            event_callback=lambda t, d: emitted.append(d) if t == "agent_prompt_rendered" else None,
+        )
+
+        assert captured["prompt"] == "FEEDBACK"
+        assert captured["state"] is sentinel
+        # The rendered-prompt event is tagged so the dashboard appends the
+        # follow-up turn to the original prompt instead of replacing it.
+        assert emitted == [
+            {"rendered_prompt": "FEEDBACK", "context_keys": ["workflow"], "continuation": True}
+        ]
+
+    def test_continuation_support_is_declared_only_by_conversation_providers(self) -> None:
+        # Requirement: only providers able to resume a completed conversation
+        # override the base declaration; everyone else inherits False.
+        from conductor.providers.aca import AcaRuntimeProvider
+        from conductor.providers.claude import ClaudeProvider
+        from conductor.providers.claude_agent_sdk import ClaudeAgentSdkProvider
+        from conductor.providers.hermes import HermesProvider
+        from conductor.providers.openai import OpenAIProvider
+
+        assert ClaudeProvider.supports_continuation is not AgentProvider.supports_continuation
+        assert OpenAIProvider.supports_continuation is not AgentProvider.supports_continuation
+        assert HermesProvider.supports_continuation is not AgentProvider.supports_continuation
+        for cls in (CopilotProvider, AcaRuntimeProvider, ClaudeAgentSdkProvider):
+            assert cls.supports_continuation is AgentProvider.supports_continuation
+        assert CopilotProvider(mock_handler=lambda a, p, c: {}).supports_continuation is False

@@ -17,6 +17,7 @@ Complete command-line reference for Conductor.
 - [`conductor validate`](#conductor-validate)
 - [`conductor doctor`](#conductor-doctor)
 - [`conductor registry`](#conductor-registry)
+- [`conductor mcp serve`](#conductor-mcp-serve)
 - [Deprecated command aliases](#deprecated-command-aliases)
 
 ## Root-Level Options
@@ -290,7 +291,9 @@ Line 3"
 
 ## `conductor status`
 
-List background workflows launched with `--web-bg`, without stopping any of them.
+List background workflows launched with `--web-bg`, without stopping any of
+them — plus a handful of recently-completed runs (their terminal status,
+when they ended, duration, tokens/cost, and error type for a failure).
 
 ```bash
 conductor status [OPTIONS]
@@ -301,14 +304,21 @@ conductor status [OPTIONS]
 | Option | Description |
 |--------|-------------|
 | `--json` | Emit machine-readable output instead of a table |
+| `--live` | List only currently-running workflows (the pre-completed-runs scope) |
 
 ### Why This Exists
 
 `conductor stop` with no arguments also lists running workflows — but it *stops* one when exactly one is running, so the natural "what's running?" reflex is destructive precisely when there is a single run to lose. `conductor status` never terminates anything.
 
-It is also read-only on disk: unlike `stop`, it never removes a run record, so a run stays discoverable even if its liveness cannot be confirmed at that moment.
+It is also read-only on disk: unlike `stop`, it never removes a run record, so a run stays discoverable even if its liveness cannot be confirmed at that moment. That read-only guarantee extends to the completed-runs section below: listing a recently-completed run never removes its terminal record either.
 
 The dashboard URL is included because there is otherwise no supported way to recover it once the launching terminal is gone. The table renders `Started` to minute precision in UTC, and the dashboard URL wraps onto a second line rather than being cropped on a narrow terminal. `--json` reports the exact recorded `started_at` value regardless.
+
+> **Contract change:** this command used to mean "runs alive right now."
+> It now also lists recently-completed runs in a second section below the
+> live one. Pass `--live` to restore the exact previous scope (no
+> completed-runs section, and `--json`'s payload has no `completed` key at
+> all — see below).
 
 ### `--json` Payload
 
@@ -325,6 +335,21 @@ The dashboard URL is included because there is otherwise no supported way to rec
       "stdout_log": "/tmp/conductor/conductor-my-workflow-20260303-120000-a1b2c3d4.bg.stdout.log",
       "url": "http://127.0.0.1:8080"
     }
+  ],
+  "completed": [
+    {
+      "run_id": "b2c3d4e5",
+      "workflow": "/tmp/other-workflow.yaml",
+      "status": "completed",
+      "started_at": "2026-03-03T12:00:00+00:00",
+      "ended_at": "2026-03-03T12:05:00+00:00",
+      "duration_seconds": 300.0,
+      "total_tokens": 1234,
+      "total_cost_usd": 0.05,
+      "error_type": null,
+      "error_message": null,
+      "event_log": "/tmp/conductor/conductor-other-workflow-20260303-120000-b2c3d4e5.events.jsonl"
+    }
   ]
 }
 ```
@@ -337,6 +362,15 @@ All three are `null` — never `""` — for a PID file written before this field
 existed. A resumed run whose checkpoint carried no usable run id still gets
 a freshly-minted `run_id` (and matching log paths), not `null`.
 
+The `running` array is **unchanged** from before this command listed
+completed runs — a script reading `payload["running"]` is unaffected by the
+addition of `completed`, which is purely additive. Each `completed` entry's
+`status` is `"completed"` or `"failed"` (the same vocabulary `conductor
+fleet list` and the Fleet Manager TUI's History screen use); `error_type`/
+`error_message` are `null` on success. Passing `--live` emits
+`{"running": [...]}` only, with no `completed` key at all — byte-identical
+to this command's payload before completed runs were added.
+
 ### Exit Codes
 
 | Code | Meaning |
@@ -346,11 +380,14 @@ a freshly-minted `run_id` (and matching log paths), not `null`.
 ### Examples
 
 ```bash
-# What is running right now?
+# What is running right now, plus recently-completed runs
 conductor status
 
 # Machine-readable, for scripts
 conductor status --json
+
+# Only what's running right now (the pre-completed-runs scope)
+conductor status --live
 ```
 
 ## `conductor stop`
@@ -597,27 +634,46 @@ conductor fleet
 ## `conductor fleet list`
 
 List every live Conductor run — foreground, foreground+web, or
-`--web-bg` — as a non-interactive Rich table. Discovers runs the same way
-`conductor stop` does, via the Fleet Manager run record
-(`~/.conductor/runs/`), so foreground runs show up here too, not just
-`--web-bg` ones. This is core functionality with no optional dependency —
-unlike the interactive `conductor fleet` TUI above, which requires the
-`tui` extra.
+`--web-bg` — plus recently-completed ones, as a non-interactive Rich table.
+Discovers live runs the same way `conductor stop` does, via the Fleet
+Manager run record (`~/.conductor/runs/`), so foreground runs show up here
+too, not just `--web-bg` ones. This is core functionality with no optional
+dependency — unlike the interactive `conductor fleet` TUI above, which
+requires the `tui` extra.
 
 ```bash
-conductor fleet list
+conductor fleet list [OPTIONS]
 ```
 
-Each row shows the workflow name, mode (`fg`, `fg-web`, or `bg`), status,
-PID, dashboard port (`—` for a foreground run with no dashboard), and start
-time. When no runs are active, it prints a dim "No runs found." line and
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--live` | List only currently-running workflows (the pre-completed-runs scope) |
+
+Each row shows the workflow name, mode (`fg`, `fg-web`, or `bg` for a live
+run, `—` for a completed one), status, PID, dashboard port (`—` for a
+foreground run with no dashboard, or a completed one), and start time. A
+live row's status is the coarse `running` (a live run can still be blocked
+at a human gate; use the TUI or `--web` for the finer-grained status); a
+completed row carries its real terminal status, `completed` or `failed`.
+The completed set is bounded by `[fleet.retention].keep_last` (see
+[`~/.conductor/config.toml`](configuration.md#machine-wide-settings-conductorconfigtoml)).
+When there is nothing to show, it prints a dim "No runs found." line and
 exits `0` — an empty fleet is a normal state, not an error.
+
+> **Contract change:** this command used to mean "runs alive right now." It
+> now also lists recently-completed runs. Pass `--live` to restore the
+> exact previous scope.
 
 ### Examples
 
 ```bash
-# List every live run
+# List every live run, plus recently-completed ones
 conductor fleet list
+
+# Only what's running right now (the pre-completed-runs scope)
+conductor fleet list --live
 ```
 
 ## `conductor fleet prune`
@@ -1097,6 +1153,71 @@ that includes one.
 
 See [design/registry.md](./design/registry.md) for the full design.
 
+## `conductor mcp serve`
+
+Start an [MCP](https://modelcontextprotocol.io/) server over stdio,
+exposing every workflow in every configured registry as a callable tool.
+See [`docs/mcp-server.md`](mcp-server.md) for the full guide — host
+configuration snippets, the exposure ladder, toolsets, the `mcp:` block,
+and the run lifecycle. This section is the flag reference.
+
+```bash
+conductor mcp serve [OPTIONS]
+```
+
+The tool list is fixed at startup and never varies across calls or
+connections. Nothing but JSON-RPC reaches stdout — the server's one
+operator-facing channel is **stderr**, where it prints a startup summary
+(exposed count, direct-vs-discovery mode, every tool's source registry
+and pinned identity, every degraded schema, and every name collision it
+qualified) and logs anomalies at warning level, since a stdio server has
+no console of its own and hosts surface stderr in their own MCP logs.
+
+### Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--registry` | every configured registry | Glob pattern selecting which configured registries to expose (repeatable). |
+| `--allow` | none | Glob pattern for the allow-list rung of the exposure ladder (repeatable). A match overrides a workflow's own `mcp.expose: false`. |
+| `--deny` | none | Glob pattern for the deny rung of the exposure ladder (repeatable) — the highest-precedence rung; a match excludes a workflow unconditionally. |
+| `--workflow-dir` | none | Local directory whose workflow files are exposed in addition to (or instead of) any registry (repeatable, non-recursive). |
+| `--toolsets` | `workflows`, `runs` | Toolset names to enable: `workflows`, `runs`, `introspect`, `diagnose` (repeatable). `introspect`/`diagnose` add zero tools unless named explicitly. |
+| `--max-direct-tools` | `25` | Above this many exposed workflows, serve the two-tool discovery pair instead of one tool per workflow. |
+| `--max-wait-seconds` | `300` | Hard ceiling, in seconds, on how long a blocking tool call (`_wait_seconds`, or `conductor_await_run`) may wait for a terminal run state. |
+| `--tool-prefix` | none | Optional prefix prepended to every generated workflow tool name. |
+| `--max-concurrent-runs` | `0` (unbounded) | Bound how many runs launched by *this server process* may be live at once. Over the cap, a launch is rejected with an instructive message, never queued. Restarting the server resets the count. |
+| `--introspect-full` | `False` | Restore full tool-call arguments and results on `conductor_run_events` instead of the default `{name, status, byte_size}` reduction. Has no effect unless the `introspect` toolset is also enabled. |
+
+### Environment
+
+The server itself reads no MCP-specific environment variables. It inherits
+the **full process environment** it was started with (provider
+credentials such as `ANTHROPIC_API_KEY`/`GITHUB_TOKEN`, `CONDUCTOR_HOME`,
+`CONDUCTOR_LOG_LEVEL`, etc.) and passes that same environment through to
+every workflow it launches — exactly as `conductor run --web-bg` already
+does, since every invocation forks a detached `conductor run` child. Set
+credentials in the environment your MCP host spawns `conductor mcp serve`
+in, the same way you would for any other `conductor run`.
+
+### Examples
+
+```bash
+# Expose every workflow in every configured registry
+conductor mcp serve
+
+# Narrow to one registry, then further to a naming convention
+conductor mcp serve --registry official --allow 'release-*'
+
+# Expose a local directory of workflows instead of (or alongside) a registry
+conductor mcp serve --workflow-dir ./workflows --max-direct-tools 10
+
+# Enable failure-diagnosis tools, and see full tool call payloads in them
+conductor mcp serve --toolsets workflows --toolsets runs --toolsets introspect --toolsets diagnose --introspect-full
+
+# Prefix generated tool names and bound concurrent launches
+conductor mcp serve --tool-prefix conductor_ --max-concurrent-runs 5
+```
+
 ## Deprecated command aliases
 
 The command surface groups related subcommands under nouns (`checkpoint`,
@@ -1122,6 +1243,12 @@ are hidden from `--help` and are slated for removal in a future release.
 | `CONDUCTOR_HOME` | Overrides `~/.conductor/` as the location of run records, the registry config, and `config.toml` |
 | `CONDUCTOR_FLEET_NO_ANIM` | Set to any non-empty value to disable Fleet Manager TUI animation (spinners, splash) and set Textual's own `animation_level` to `none`. Wins over `CONDUCTOR_FLEET_ANIM` and over remote-session detection if both apply. Useful over slow SSH links (which are *not* auto-detected), in recorded terminals, and where movement is distracting. RDP sessions are detected automatically and disable animation by default even without this variable set |
 | `CONDUCTOR_FLEET_ANIM` | Set to any non-empty value to force Fleet Manager TUI animation back on over a detected RDP session. Has no effect when `CONDUCTOR_FLEET_NO_ANIM` is also set |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | OTLP collector endpoint; setting it enables tracing |
+| `OTEL_EXPORTER_OTLP_PROTOCOL` | Export protocol: `grpc` (default), `http/protobuf`, or `http/json`. Copilot CLI tracing requires `http/protobuf` or `http/json`. |
+| `OTEL_SERVICE_NAME` | Service name reported to the collector; defaults to `conductor` |
+| `OTEL_RESOURCE_ATTRIBUTES` | Key-value pairs for resource attributes (e.g. `deployment.environment=testing`) |
+| `OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT` | Enables native-span content capture (Pydantic AI and Copilot CLI) when set to `true`, `SPAN_ONLY`, or `SPAN_AND_EVENT` |
+| `OTEL_SDK_DISABLED` | Set to `true` to disable all tracing for the process |
 
 ## Exit Codes
 
@@ -1136,6 +1263,7 @@ are hidden from `--help` and are slated for removal in a future release.
 ## See Also
 
 - [Fleet Manager](./fleet.md) - The `conductor fleet` TUI: screens, key bindings, gate resolvability, retention
+- [MCP Server](./mcp-server.md) - Exposing workflows as MCP tools via `conductor mcp serve`
 - [Workflow Syntax Reference](./workflow-syntax.md) - Complete YAML syntax
 - [Examples](../examples/) - Example workflows
 - [Providers](./providers/) - Provider-specific documentation
