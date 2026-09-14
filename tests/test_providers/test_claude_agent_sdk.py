@@ -3144,6 +3144,41 @@ class TestMcpAllowlistEnforcement:
         provider._enumerated_mcp_tools = {"docs__read"}
         assert await provider._enumerate_mcp_tools() == {"docs__read"}
 
+    @patch("conductor.providers.claude_agent_sdk.CLAUDE_AGENT_SDK_AVAILABLE", True)
+    async def test_skill_tool_is_granted_alongside_a_nonempty_allowlist(self) -> None:
+        """The Skill grant on the allowlist arm, which no other test reaches.
+
+        ``_resolve_tool_config`` grants ``Skill`` twice over: once on the
+        ``tools: []`` carve-out, and once here, appended to a non-empty
+        allowlist. Only the first arm is covered elsewhere, and deleting this
+        append leaves the whole suite green -- the model would then be shown a
+        tier's discovered skills holding no tool to invoke them.
+        """
+        captured: dict = {}
+
+        async def fake_query(**kwargs):
+            captured["allowed"] = kwargs["options"].allowed_tools
+            yield _result(result="ok")
+
+        agent = AgentDef(name="t", prompt="hi", tools=["filesystem__read_text_file"])
+        with patch("conductor.providers.claude_agent_sdk.query", fake_query):
+            provider = ClaudeAgentSdkProvider(
+                mcp_servers={"filesystem": {"type": "stdio", "command": "fs"}},
+                setting_sources=["project"],
+            )
+            # Pre-seed so a non-empty allowlist does not spawn the real server.
+            provider._enumerated_mcp_tools = {"filesystem__read_text_file"}
+            await provider.execute(
+                agent=agent,
+                context={},
+                rendered_prompt="hi",
+                tools=["filesystem__read_text_file"],
+            )
+
+        assert "Skill" in captured["allowed"]
+        # The declared tools survive alongside it.
+        assert "mcp__filesystem__read_text_file" in captured["allowed"]
+
 
 class TestServerToolFilterEnforcement:
     """A per-server ``tools:`` filter is honored by denying the complement."""

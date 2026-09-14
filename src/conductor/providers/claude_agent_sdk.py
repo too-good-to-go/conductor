@@ -1863,9 +1863,16 @@ class ClaudeAgentSdkProvider(AgentProvider):
                 discovered by the CLI itself from a non-empty
                 ``setting_sources`` (an agent's own ``skills: []`` opts out
                 of the tier and so out of this too). Adds the ``Skill`` tool
-                to an explicit ``tools: []`` as its one carve-out. Without the
-                tool the CLI shows the model no skill listing at all, so a
-                tier would discover skills that can never be reached.
+                on both paths: to an explicit ``tools: []`` as its one
+                carve-out, and appended to a non-empty allowlist alongside the
+                tools the agent declared. Without the tool the CLI shows the
+                model no skill listing at all, so a tier would discover skills
+                that can never be reached.
+            enumerated_mcp_tools: Every ``<server>__<tool>`` the declared
+                stdio servers expose, used to compute the complement to deny.
+                Only passed when the agent declares a non-empty allowlist or a
+                per-server filter is in force, since enumeration starts the
+                servers.
 
         Returns:
             A ``(sdk_tools, permission_mode, allowed_tools, disallowed_tools)``
