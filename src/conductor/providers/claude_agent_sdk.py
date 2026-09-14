@@ -309,11 +309,15 @@ def _server_tool_filters(mcp_servers: dict[str, Any]) -> dict[str, set[str]]:
 
 
 def _stdio_path_args(mcp_servers: dict[str, Any]) -> list[str]:
-    """Absolute directory args of stdio MCP servers, for ``add_dirs``.
+    """Absolute directory args of stdio MCP servers.
 
-    The CLI's MCP Roots override a server's own path args with cwd +
-    ``--add-dir``, so a server declared with two directories is rooted at one
-    and the rest denied. Forwarding these restores the declared scope.
+    Currently uncalled. Do NOT wire this into ``add_dirs``: ``--add-dir``
+    takes no part in MCP Roots negotiation, so it cannot widen what a server
+    permits. The CLI advertises exactly one root, its cwd, and a client's sole
+    root replaces every argv root outright —
+    ``tests/test_integration/test_mcp_roots_negotiation.py`` pins that against
+    the real server. ``AgentDef.settings_dir`` is the only source of
+    ``add_dirs``.
     """
     paths: list[str] = []
     for config in mcp_servers.values():
