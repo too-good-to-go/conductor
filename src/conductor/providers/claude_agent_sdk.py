@@ -1548,7 +1548,7 @@ class ClaudeAgentSdkProvider(AgentProvider):
         Tools are disabled and no MCP server attaches — this is a plain
         text-in/text-out turn, matching the other providers.
         """
-        if not CLAUDE_AGENT_SDK_AVAILABLE:
+        if query is None or ClaudeAgentOptions is None:
             raise ProviderError("Claude Agent SDK not available")
 
         prior = "".join(
