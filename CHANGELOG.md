@@ -5,7 +5,359 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.33...HEAD)
+## [Unreleased](https://github.com/microsoft/conductor/compare/v0.1.37...HEAD)
+
+### Added
+
+- **Direct MCP workflow steps (`type: mcp`)** (#392): calls a tool on a
+  configured `runtime.mcp_servers` stdio server directly without an LLM.
+  Arguments are rendered recursively with Jinja2 and auto-coerced to
+  JSON-native types; the result envelope (`content`, `structured`, `is_error`)
+  merges structured keys directly onto the output dict so routes and downstream
+  steps can branch on `output.is_error` or individual fields. Calls serialize
+  per server process to maintain stdio stream integrity while distinct servers
+  execute concurrently in parallel groups. Output text payload is bounded by
+  `runtime.tool_output` with spill-to-file support while structured data is
+  preserved intact. Step and result values are excluded from all lifecycle
+  events (`mcp_started`, `mcp_completed`, `mcp_failed`), with failure messages
+  redacted to a safe category and full exception traces written only to a
+  private per-run `*.mcp-diagnostics.log` file (named by the redacted
+  message). See
+  [`docs/workflow-syntax.md`](docs/workflow-syntax.md#mcp-steps) and
+  [`examples/mcp-step.yaml`](examples/mcp-step.yaml).
+- **OpenTelemetry spans for direct MCP workflow steps**: each `type: mcp`
+  execution is exported as an `execute_tool` span under its workflow, parallel
+  group, or for-each item. Spans include bounded server, tool, result-size, and
+  truncation metadata without recording arguments, result contents, or spill
+  paths, and preserve routed tool errors, execution failures, and interrupted
+  attempts as distinct outcomes.
+
+### Fixed
+
+- **Pydantic AI structured-output agents explicitly require `final_result`** —
+  the generated output tool now tells models that they must call it before
+  finishing and that plain-text responses are not accepted. This improves
+  adherence for local models behind OpenAI- or Anthropic-compatible endpoints
+  without replacing tool-based output, weakening schema validation, or
+  changing authored system prompts.
+
+## [0.1.37](https://github.com/microsoft/conductor/compare/v0.1.36...v0.1.37) - 2026-09-09
+
+### Added
+
+- **Always-on client-side context compaction for the `claude` and `openai`
+  providers** (#503) — an agent whose conversation outgrows the model's
+  context window no longer fails the run. Conductor condenses the history
+  once it crosses a calculated trigger threshold and continues. The trigger
+  is computed from an additive reserve formula — context window minus output
+  limit minus an effective tool-output-derived buffer (clamped to at most 25%
+  of the window) — and compaction is disabled, with a `disabled_reason` on
+  the `agent_compaction_config` event, when the remaining trigger would fall
+  below 4096 tokens. Condensing runs a three-stage strategy: clearing old
+  tool results first, summarizing older messages with a nested model call,
+  and sliding the window as a deterministic fallback. It is client-side only,
+  so behaviour is identical behind an API proxy, always on with no new YAML
+  surface, and fail-open — a compaction failure never aborts a run, and an
+  unrecovered one disables compaction for the rest of that agent execution.
+  Every compaction is surfaced in the console, the JSONL event log, and the
+  web dashboard.
+
+- **Provider-advertised model token-limit metadata** (#503) for compaction
+  sizing. The `claude` and `openai` providers read per-model input/output
+  token limits from their SDK model listings (with full pagination for the
+  Anthropic SDK, and a vendor-field parser for OpenAI-compatible endpoints),
+  the `copilot` provider implements the `get_max_output_tokens` hook, and
+  resolution falls back through the `genai-prices` registry to a conservative
+  default.
+
+- **Opt-in `runtime.provider.setting_sources` on `claude-agent-sdk`** (#501) —
+  selects which Claude Code settings tiers (`user` / `project` / `local`) a
+  session may load. It is empty by default, so behaviour is unchanged unless a
+  workflow asks: the provider still sends an explicit `[]`, which is
+  load-bearing because the SDK re-defaults an unset value to
+  `["user", "project"]` whenever `skills` is set. The case it exists for is an
+  agent whose `working_dir` is a *target* repository shipping its own
+  `.claude/skills` — the SDK has `--plugin-dir` but no `--skill-dir`, so that
+  repo otherwise has to package its skills as a Claude Code plugin;
+  `[project]` reads them, and the repo's `CLAUDE.md` / `.claude/rules` with
+  them. An enabled tier brings that tier's **hooks**, so it is only for
+  repositories trusted as much as the workflow itself; the field is rejected on
+  every other provider name rather than accepted and silently ignored, counts
+  as structured config (so `--provider` overrides warn before discarding it and
+  `-v` shows it), and a per-agent `skills: []` opts that agent out of the tiers
+  entirely. See
+  [`examples/claude-agent-sdk-setting-sources.yaml`](examples/claude-agent-sdk-setting-sources.yaml).
+- **OpenTelemetry tracing**, new opt-in OpenTelemetry tracing feature activated by
+  `OTEL_EXPORTER_OTLP_ENDPOINT`.
+  It instruments workflow orchestration to emit spans for workflows, agents, parallel/for-each
+  groups, steps, and tool executions. For `claude` and `openai` providers, it also registers
+  and enables native Pydantic AI instrumentation; for `copilot`, it captures native spans
+  from the Copilot CLI child process over OTLP HTTP. In each case Conductor unifies
+  orchestrator spans and LLM/tool calls into a single trace tree. Tracing is enabled by
+  configuring standard `OTEL_*` environment variables for an OTLP collector. See
+  `docs/telemetry.md` and `examples/telemetry.yaml`.
+  * Added native Copilot CLI spans over OTLP HTTP using W3C trace-context propagation, backed by a per-run protocol and endpoint latch that logs a warning if gRPC is used.
+
+- **Per-agent `settings_dir` on `claude-agent-sdk`** (#513) — selects which
+  directory's `project` settings tier supplies an agent's **skills**,
+  independently of `working_dir`. The CLI advertises exactly one MCP root —
+  its cwd — and a filesystem MCP server that sees a Roots-capable client
+  discards the directories in its own argv, so pointing `working_dir` at a
+  target repository to pick up its skills also narrowed the agent's only MCP
+  root onto it. `settings_dir` splits the two, letting cwd stay wide enough
+  for every path the agent must read. It carries a second, unconditional
+  effect: `add_dirs` widens the model's built-in `Read`/`Edit`/`Bash` to that
+  tree regardless of any settings tier, though no Conductor configuration
+  reaches a permission mode where that is observable today. Only the skills
+  of that directory travel — not `CLAUDE.md`, `.claude/rules/*.md`,
+  `.claude/settings.json` or `.claude/agents`, all measured. Refused at
+  `conductor validate` *and* at run time on a provider that cannot apply it;
+  a `settings_dir` whose `project` tier is not enabled warns in both places
+  too, since the filesystem grant applies even when the skills half no-ops.
+  Reported on the agent lifecycle events so the grant is auditable. See
+  [`examples/claude-agent-sdk-settings-dir.yaml`](examples/claude-agent-sdk-settings-dir.yaml).
+
+### Changed
+
+- **Claude default `max_tokens` raised from 8192 to 16384** when unset
+  (#503). This doubles the worst-case output cost per call for users who
+  never set it; set `runtime.max_tokens` explicitly to keep the former
+  behavior. For Claude thinking agents, `low` or `medium` effort levels
+  without an explicit `max_tokens` limit now send 16384 tokens instead of the
+  former 8192 or 12288 tokens.
+
+- **The `openai` provider honors vendor-advertised token limits** (#503) from
+  the models listing when available, using them to size the compaction output
+  reserve.
+
+- **A `working_dir` or `settings_dir` template that renders empty is now an
+  error** (#513). Previously an empty render resolved to the workflow file's
+  own directory — `Path("")` is `Path(".")`, which is not absolute, so it was
+  joined onto that directory and passed the existence check — and the agent
+  ran there. A value meaning "nothing" silently becoming something real is
+  the defect; for `settings_dir` it would also have granted the model access
+  to the workflow's own tree. Both fields now fail before the provider call,
+  naming the field and the template it came from.
+
+### Fixed
+
+- **`openai`: retry transient errors delivered inside an SSE stream** (#506) —
+  the OpenAI SDK raises a bare `openai.APIError` (no HTTP status) for an
+  `error` object embedded in a stream, which pydantic-ai does not translate,
+  so a configured `retry:` policy was skipped and the run failed after the
+  first attempt. Now retried: OpenAI mid-stream 5xx (`server_error` /
+  `internal_server_error`), OpenAI rate limits (`type` `requests` / `tokens`
+  with code `rate_limit_exceeded`), Anthropic-shaped gateway errors proxied
+  unchanged (`rate_limit_error` / `overloaded_error` / `api_error`), and
+  stream errors with no parseable payload `type` (a non-object `error` value
+  from an Ollama/vLLM gateway, or an Azure-style `{"code": ...}` shape),
+  which are treated like broken streams. Still fatal: recognized client-side
+  payload types (e.g. `invalid_request_error`) and every HTTP 4xx. Errors a
+  narrowed `retry_on:` declines are now wrapped in `ProviderError` naming the
+  declined category instead of escaping as raw SDK exceptions, a declined
+  retry is logged at warning level (a taken one already was), and a fatal
+  bare `APIError`'s message now carries the payload `type`/`code` the SDK
+  leaves out of `str(e)`.
+
+- **Context compaction window guard against token-dense drift** (#507) — the
+  `claude` / `openai` providers' compaction trigger anchors on
+  provider-reported token usage and estimates everything after the anchor
+  with a ~4-characters-per-token heuristic, which undercounts token-dense
+  content (CJK and other non-Latin scripts, base64, hex, minified data) by
+  2-4x. A dense suffix could therefore grow the real request past a known
+  context window while the trigger estimate stayed below the threshold, and
+  the provider rejected the request with `context_length_exceeded`. A second,
+  density-calibrated estimate now guards the hard window: it matches the
+  primary heuristic on ordinary prose, counts text with a substantial
+  non-ASCII share at ~1 token per character, and whitespace-poor ASCII blobs
+  at ~2 characters per token, so it fires only on genuinely dense content —
+  never on a history that is merely large. When it fires, the tier chain is
+  driven directly against that measurement (the inner strategy's own gate
+  would re-measure with the same heuristic that under-counted the content
+  and no-op), until the estimate is back under the target. Telemetry stays on
+  the token scale: `agent_compaction_start` gains `trigger_reason`
+  (`"trigger"` / `"window_guard"`) and a separate `density_tokens` field
+  instead of overloading `tokens_before`, and `agent_compaction_complete`
+  gains `degraded_estimators` and `still_over_window` so a guard compaction
+  that could not get back under the window reads as degraded, not as false
+  success. A failed primary measurement falls back to an independent
+  density-calibrated estimate that shares no code with it, and a double
+  failure is reported as a new `agent_compaction_skipped` event
+  (`reason: "estimate_unavailable"`) rather than vanishing into stderr. See
+  [Workflow Syntax → Context Compaction](docs/workflow-syntax.md#context-compaction).
+
+- **Validator retries preserve the primary agent conversation** (#511) — when a
+  semantic validator rejects output from the Claude, OpenAI, or Hermes provider,
+  the correction now continues the completed agent conversation — the Pydantic
+  AI message history for Claude/OpenAI, the run's own message list for Hermes —
+  and sends validation feedback as the next user turn. This preserves prior
+  reasoning and tool exchanges
+  without repeating the original prompt, workspace instructions, or injected skills.
+  A failed re-run now reports its cause on the `agent_validation_failed` event and in
+  the console log, and the dashboard keeps the agent's original prompt visible instead
+  of replacing it with the feedback-only turn.
+
+- **Concurrent agents no longer build duplicate provider instances** (#512) —
+  resolving one provider type from two agents at once (a parallel group, or a
+  `for_each` with `max_concurrent > 1`) was a check-then-act with an `await`
+  between the cache check and the cache write, so each could construct its
+  own instance and the second write replaced the first, leaving the two
+  agents holding different objects for the same provider type. A waiter could
+  also observe a provider before its restored resume-session state had been
+  applied. Construction, resume-session wiring, and cache publication are now
+  one operation under a registry-local lock that re-checks the cache; cached
+  reads stay lock-free, a failed construction caches nothing and strands no
+  waiter, and distinct provider types remain independent.
+
+- **A multi-line reply to a terminal dialog is now one turn** (#509) —
+  dialog mode was the only free-text human-input surface that could not accept
+  a multi-line answer (`QuestionDef.multiline` defaults to `True` and
+  `GateOption.multiline` opts in, both served by one reader in `gates/human.py`).
+  The dialog gate read a reply with single-line `Prompt.ask`, so pasting a block
+  of text into an interactive terminal dispatched *each line* as its own turn: a
+  three-line paste became three separate questions to the model, each answered
+  against a fragment, and the paste's trailing newline added a fourth turn with
+  empty content. Terminal turns now read through the multi-line reader already
+  behind the human gate's `.` sentinel, submitted with `/send` on its own line,
+  so internal newlines survive and a paste is a single message. An empty or
+  whitespace-only submission is no longer dispatched as a turn. A dismiss
+  keyword is recognised only once a turn is submitted, so on a tty `done` now
+  needs `/send` after it, and both the opening banner and the failure-recovery
+  notice say so rather than naming a keystroke that does nothing there.
+
+  Ctrl-D at the start of a line (Ctrl-Z then Enter on Windows) also submits the
+  lines entered so far, or dismisses the dialog when there are none. Because a
+  terminal's EOF does not persist, abandoning a part-written reply that way now
+  sends what was already entered and a second Ctrl-D is needed to leave, where
+  one used to exit; on an empty prompt it still exits in one keystroke.
+
+  The dialog uses `/send` where the human gate keeps `.`, since a lone `.` is
+  likelier to be prose in a conversational reply. Off a tty — a pipe or CI —
+  replies are still read one line at a time and `/send` has no effect; the one
+  change on that path is that a blank line is now skipped instead of dispatched
+  as an empty turn. The web dashboard is unaffected: it takes a separate path
+  that already delivered each message whole.
+
+## [0.1.36](https://github.com/microsoft/conductor/compare/v0.1.35...v0.1.36) - 2026-09-02
+
+### Added
+
+- **`conductor mcp serve`** (#432) — exposes your registered Conductor
+  workflows as [MCP](https://modelcontextprotocol.io/) tools to any
+  MCP-compatible host (Claude Code, VS Code, Cursor, etc.) over stdio,
+  with no workflow edits required: every workflow in every configured
+  registry is exposed by default, with a typed `inputSchema` derived from
+  its own `input:` block. A tool call always forks a real detached
+  `conductor run` — the server never executes a workflow in-process — and
+  by default **returns immediately** with a run handle carrying the
+  `run_id`, dashboard `url` and `port`, the captured log paths, and the
+  `conductor fleet` / `conductor status` commands for watching it from a
+  terminal, so the caller can report the run back and move on while it
+  keeps going. A caller may opt into a bounded wait per call
+  (`_wait_seconds`, capped by `--max-wait-seconds`), which changes only
+  whether *that call* blocks — never how the workflow runs; start the
+  server with `--max-wait-seconds 0` to make every invocation
+  non-blocking regardless of what a caller requests. A run that has not
+  completed (immediate, at-gate, failed, or timed-out) returns the handle;
+  a run that completes within a bounded wait
+  returns its output inline, or — once serialized `output:` exceeds 50 KB
+  — spilled to a file with a `resource_link` and no dashboard `url`. New
+  `conductor_run_status` / `conductor_await_run` / `conductor_cancel_run`
+  / `conductor_list_runs` tools answer for a `run_id` before, during, at a
+  human gate, and after a run has finished — the human gate is never
+  auto-skipped; a run that reaches one parks and reports its dashboard
+  approval URL until a person resolves it. Optional `introspect`/`diagnose`
+  toolsets (off by default; enable with `--toolsets`) add event-query,
+  per-step detail, `conductor doctor`/`conductor validate` equivalents, and
+  links (never file contents) to a run's raw logs. `--allow`/`--deny`
+  narrow or force the exposed set; a registry above `--max-direct-tools`
+  (default 25) degrades to a two-tool discovery pair instead of failing or
+  overflowing a host's tool-count limit. See
+  [`docs/mcp-server.md`](docs/mcp-server.md) for the full guide, including
+  a dedicated *Limits* section for what this release deliberately does not
+  do (no `outputSchema`, no Streamable HTTP transport, tool call payloads
+  withheld unless `--introspect-full`).
+- **`workflow.mcp:` block** — per-workflow configuration read by
+  `conductor mcp serve` to decide how a workflow is exposed as an MCP
+  tool: `expose` (default `true`), `mode` (`async`/`sync`/`auto`),
+  `read_only`, `destructive`, and `estimated_minutes`. Every field
+  defaults to the value that keeps an existing workflow with no `mcp:`
+  block at all exposed identically to one that declares the defaults
+  explicitly, so no existing workflow needs editing. An unknown key
+  inside the block is a `conductor validate` schema error, not a silently
+  ignored typo. See `examples/mcp-serve.yaml`.
+
+### Changed
+
+- **`conductor status` and `conductor fleet list` now also list
+  recently-completed runs, not just currently-running ones — a contract
+  change to what these commands mean.** Previously both meant "runs alive
+  right now"; a finished run disappeared the moment its process exited.
+  Each command now renders (or, for `status --json`, returns in an
+  additive `completed` array) a bounded set of recently-completed runs
+  with their terminal status (`completed`/`failed`), when they ended,
+  duration, tokens/cost, and error type for a failure — sourced from the
+  terminal run record every run now writes on exit. `conductor fleet
+  list`'s completed rows are bounded by `[fleet.retention].keep_last`.
+  Both commands remain read-only: listing a completed run never removes
+  its terminal record. Pass `--live` to either command to restore the
+  exact previous scope (`status --json --live` also drops the
+  `completed` key from the payload entirely, so an existing scripted
+  consumer of `payload["running"]` is otherwise unaffected by this
+  change). The Fleet Manager TUI's History screen also gained a failed
+  run's error message and a completed run's rendered output, reachable
+  by selecting a row, without adding a new column to its table.
+
+### Fixed
+
+- **The `mcp` SDK dependency is now bounded below its breaking 2.0 release**
+  (`mcp>=1.28.1,<2`). `mcp` 2.0.0 renamed the camelCase attributes the
+  existing MCP client reads (`Tool.inputSchema` -> `input_schema`), so an
+  installation whose lock had already floated to `mcp` 2.x had a client
+  that connected to a server and then raised `AttributeError` on every
+  tool listing — MCP tools were silently non-functional. Re-locking with
+  this bound restores them; the pin does not change behavior for anyone
+  already on `mcp` 1.x.
+
+## [0.1.35](https://github.com/microsoft/conductor/compare/v0.1.34...v0.1.35) - 2026-08-28
+
+### Removed
+
+- **Dead workflow lifecycle hooks (`on_start` / `on_complete` / `on_error`)**
+  (#476). The `hooks:` block was parsed and its templates rendered, but the
+  result was discarded — never emitted as an event, logged, shown, stored, or
+  used for any side effect — so the feature was entirely unobservable,
+  including when a hook failed. `HooksConfig`, `WorkflowDef.hooks`, the engine's
+  `_execute_hook` / `LifecycleHookResult` and all call sites, and the Hooks
+  section of `docs/workflow-syntax.md` have been removed. A workflow that still
+  declares `hooks:` now fails validation with a clear error rather than
+  silently ignoring the block. Lifecycle hooks may return later, but the right
+  syntax will be designed against a concrete requirement (emitting an event,
+  invoking a `type: script` step, or calling a webhook) rather than rendering a
+  template and throwing it away.
+
+### Fixed
+
+- **`conductor doctor`'s table output no longer dies part-written on a
+  `cp1252` console** (#401). The Installed/Credentials/Connection/Models
+  columns hardcoded `✓`/`✗`/`○`/`⚠`, none of which cp1252 can encode, so a
+  run on a legacy Windows console raised `UnicodeEncodeError` mid-table,
+  after the Environment section had already printed. `conductor doctor`
+  now resolves each glyph once per invocation against the output console's
+  stream encoding, falling back to `OK`/`X`/`o`/`!` when the Unicode
+  glyphs cannot be encoded; the `--json` path was already safe and is
+  unchanged.
+- **Plugin flavor resolution (Claude vs. Copilot builds)** (#497). A
+  Claude-built plugin's `agents/*.md` subagents (no `.agent.md` suffix) were
+  silently never loaded — the candidate-file rule was hardcoded to the
+  Copilot build's convention. Flavor is now read off the manifest that
+  actually matched and threaded as a tie-break-only axis through plugin
+  resolution, so `provider: copilot` agents using a Claude-built plugin now
+  get its subagents too. Also adds `~/.copilot/settings.json` marketplace
+  resolution as a fallback for `plugin@marketplace` references, and several
+  new non-fatal warnings when a build cannot be determined unambiguously.
+
+## [0.1.34](https://github.com/microsoft/conductor/compare/v0.1.33...v0.1.34) - 2026-08-24
 
 ### Added
 
@@ -22,6 +374,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A custom `base_url` requires an explicit `api_key`: an ambient `OPENAI_API_KEY`
   is never forwarded to a non-OpenAI endpoint.
 
+- **Fleet TUI launch directory** (#477) — `conductor fleet` can now start runs
+  in a directory other than the one it was itself launched from. `d` on the
+  Runs screen (or `ctrl+d` on New run) opens a directory picker; the chosen
+  directory is the base a relative workflow reference on the New Run screen
+  resolves against, and the working directory that a launched or resumed run's
+  detached child inherits. It is process-lifetime only — there is no
+  `config.toml` key and no state file, and it resets when `conductor fleet`
+  exits. It does not affect `runtime.working_dir` / `agent.working_dir`, and it
+  is not a filter: Runs and History still show the whole fleet. See
+  `docs/fleet.md`.
+
+- **`runtime.idle_timeout_seconds` / `runtime.max_idle_recovery_attempts`**
+  (#488) — Copilot-only knobs to tune the idle watchdog for workflows with
+  legitimately long tool calls. `idle_timeout_seconds` sets the time without
+  SDK events before a session is treated as idle (default 90s);
+  `max_idle_recovery_attempts` caps the number of "please continue" prompts
+  sent before failing (default 5; `0` fails on the first genuine idle
+  without ever injecting a prompt). See `docs/configuration.md` and
+  `docs/workflow-syntax.md`.
+
 ### Changed
 
 - The Pydantic AI dependency was narrowed from the full `pydantic-ai` package to
@@ -34,6 +406,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **The Copilot idle watchdog no longer fires during long-running tool
+  calls** (#488). The SDK does not guarantee any events during a tool
+  call — `tool.execution_progress` / `tool.execution_partial_result` exist
+  in the SDK schema but are opt-in per tool, so for most tool calls nothing
+  arrives between `tool.execution_start` and `tool.execution_complete` — so
+  a stale idle clock while a tool was still executing was previously
+  indistinguishable from a genuinely stuck session — triggering a spurious
+  "please continue" recovery prompt mid tool-call. That prompt's
+  conversational reply then overwrote the agent's eventual structured
+  output (`response_content` is last-message-wins), turning a healthy run
+  into a non-retryable failure. In-flight tool calls (tracked by
+  `tool_call_id`) now suppress idle recovery entirely while any remain
+  outstanding; `max_session_seconds` is the sole backstop for a genuinely
+  wedged tool. Recovery-prompt and
+  stuck-session messages also no longer misattribute the failure to a tool
+  that has already completed — `last_activity_ref`'s tool name is now
+  cleared (or rolled to another still-in-flight tool) on
+  `tool.execution_complete` instead of only ever being set. The first
+  occurrence of extended suppression during a session is logged at
+  `warning` level (naming the in-flight tools and the `max_session_seconds`
+  backstop); further occurrences in the same session are debug-only.
 - Retry classification now covers the `ModelHTTPError` and `ModelAPIError` types
   pydantic-ai actually raises, so `408`, `429` and `5xx` responses are retried on
   the Claude provider as well as the new OpenAI one. Previously they were treated
@@ -50,6 +443,54 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Conductor now reads both fields through a shared helper that tries the 2.x
   name and falls back to the 1.x one, preserving compatibility with both MCP
   1.x and 2.x.
+- **The Fleet Manager TUI's launch-directory picker no longer clobbers its
+  own prefill** (#486). Textual posts a `NodeHighlighted` event for the
+  directory tree's own root at mount, from reactive initialisation, with no
+  user interaction involved; `DirectoryPickerModal` mirrored every such
+  event into the input, silently replacing the prefilled launch directory
+  with its parent before the user ever touched the tree. The mirror now
+  fires only while the tree actually has focus.
+- **The Fleet Manager no longer loses data from large event logs** (#485).
+  The Runs, History, and run-detail screens read a run's JSONL event log
+  through three separate bounded windows — a 512 KiB tail, a 512 KiB head
+  recovery read, and an 8 MiB whole-log cap — that a long-lived or resumed run
+  outgrows. On a real 9.72 MB / 20,361-line log this lost the current step and
+  the token/cost totals, and a resumed run's second `workflow_started` fell
+  outside the head window, so the wrong workflow topology was reported. All
+  three windows are replaced by one streamed reader bounded only by the longest
+  individual line, and a resumed run's totals now accumulate across generations
+  while its status, gate, and topology reflect the current attempt. The Runs
+  screen's ~2s poll prefilters lines by event type before parsing them, so the
+  uncapped read is also faster than the capped one it replaces.
+- **A run record could silently fail to be removed on Windows** (#486).
+  `remove_run_record` deleted a record with a single unretried `unlink`, and
+  `remove_run_record_for_current_process` renamed it into a quarantine path
+  with a single unretried `rename`; on Windows, a concurrent reader can make
+  either fail with a sharing violation, leaving a stale record behind. Both
+  paths now use the same bounded retry that `write_run_record` already used
+  for its own `os.replace`.
+- **The Copilot provider now recovers automatically when its nested runtime
+  process dies** (#483), instead of retrying against a dead process with
+  a misleading "Check that copilot CLI is installed and authenticated"
+  error. A dead spawned runtime is now detected via
+  `subprocess.Popen.poll()` on the SDK's own child handle and via explicit
+  recognition of `BrokenPipeError` / `ConnectionResetError` at the
+  agent-execution SDK boundary (including during idle-recovery "continue"
+  prompts, which previously burned every recovery attempt and were
+  reported as a stuck *agent* rather than a dead *process*). Recovery
+  rebuilds the SDK client the next time it is needed, so the existing
+  retry loop lands its next attempt on a fresh runtime with no change to
+  retry-loop shape; a runtime that keeps dying without a single
+  successful call in between fails fast after 2 consecutive restarts
+  (a fixed, non-configurable cap — with the default `max_attempts` of 3,
+  a single agent execution can only trigger 2 restarts on its own, so the
+  cap mainly bites across agents in the same workflow) rather than
+  looping forever, while a long-running, otherwise-healthy workflow can
+  restart it as many times as needed. A broken connection to an
+  **externally-owned** runtime (`runtime_url` /
+  `COPILOT_PROVIDER_RUNTIME_URL`) is treated differently: it is never
+  retried or respawned, since the orchestrator that owns that runtime is
+  responsible for its health checks and restarts.
 
 ## [0.1.33](https://github.com/microsoft/conductor/compare/v0.1.32...v0.1.33) - 2026-08-18
 

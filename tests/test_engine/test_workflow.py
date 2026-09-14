@@ -20,7 +20,6 @@ from conductor.config.schema import (
     ContextConfig,
     ForEachDef,
     GateOption,
-    HooksConfig,
     InputDef,
     LimitsConfig,
     OutputField,
@@ -1792,147 +1791,6 @@ class TestWorkflowEngineHumanGates:
         mock_cli_handle.assert_not_called()
 
 
-class TestWorkflowEngineLifecycleHooks:
-    """Tests for lifecycle hooks execution."""
-
-    @pytest.mark.asyncio
-    async def test_on_start_hook_executed(self) -> None:
-        """Test that on_start hook is executed at workflow start."""
-        from conductor.config.schema import HooksConfig
-
-        config = WorkflowConfig(
-            workflow=WorkflowDef(
-                name="hooks-workflow",
-                entry_point="agent1",
-                hooks=HooksConfig(
-                    on_start="Workflow started with input: {{ workflow.input.question }}",
-                ),
-            ),
-            agents=[
-                AgentDef(
-                    name="agent1",
-                    model="gpt-4",
-                    prompt="Hello",
-                    output={"result": OutputField(type="string")},
-                    routes=[RouteDef(to="$end")],
-                ),
-            ],
-            output={"result": "{{ agent1.output.result }}"},
-        )
-
-        def mock_handler(agent, prompt, context):
-            return {"result": "done"}
-
-        provider = CopilotProvider(mock_handler=mock_handler)
-        engine = WorkflowEngine(config, provider)
-
-        result = await engine.run({"question": "test"})
-
-        assert result["result"] == "done"
-
-    @pytest.mark.asyncio
-    async def test_on_complete_hook_executed(self) -> None:
-        """Test that on_complete hook is executed on success."""
-        from conductor.config.schema import HooksConfig
-
-        config = WorkflowConfig(
-            workflow=WorkflowDef(
-                name="hooks-workflow",
-                entry_point="agent1",
-                hooks=HooksConfig(
-                    on_complete="Workflow completed with result: {{ result }}",
-                ),
-            ),
-            agents=[
-                AgentDef(
-                    name="agent1",
-                    model="gpt-4",
-                    prompt="Hello",
-                    output={"result": OutputField(type="string")},
-                    routes=[RouteDef(to="$end")],
-                ),
-            ],
-            output={"result": "{{ agent1.output.result }}"},
-        )
-
-        def mock_handler(agent, prompt, context):
-            return {"result": "success"}
-
-        provider = CopilotProvider(mock_handler=mock_handler)
-        engine = WorkflowEngine(config, provider)
-
-        result = await engine.run({})
-
-        assert result["result"] == "success"
-
-    @pytest.mark.asyncio
-    async def test_on_error_hook_executed(self) -> None:
-        """Test that on_error hook is executed on failure."""
-        from conductor.config.schema import HooksConfig
-        from conductor.exceptions import ProviderError
-
-        config = WorkflowConfig(
-            workflow=WorkflowDef(
-                name="hooks-workflow",
-                entry_point="agent1",
-                hooks=HooksConfig(
-                    on_error="Error: {{ error.type }} - {{ error.message }}",
-                ),
-            ),
-            agents=[
-                AgentDef(
-                    name="agent1",
-                    model="gpt-4",
-                    prompt="Hello",
-                    output={"result": OutputField(type="string")},
-                    routes=[RouteDef(to="$end")],
-                ),
-            ],
-            output={"result": "{{ agent1.output.result }}"},
-        )
-
-        def mock_handler(agent, prompt, context):
-            # Simulate a provider error during execution
-            raise ProviderError("API request failed", provider_name="copilot", status_code=500)
-
-        provider = CopilotProvider(mock_handler=mock_handler)
-        engine = WorkflowEngine(config, provider)
-
-        with pytest.raises(ProviderError, match="API request failed"):
-            await engine.run({})
-
-    @pytest.mark.asyncio
-    async def test_hooks_not_defined(self) -> None:
-        """Test that workflow works without hooks defined."""
-        config = WorkflowConfig(
-            workflow=WorkflowDef(
-                name="no-hooks-workflow",
-                entry_point="agent1",
-                # No hooks defined
-            ),
-            agents=[
-                AgentDef(
-                    name="agent1",
-                    model="gpt-4",
-                    prompt="Hello",
-                    output={"result": OutputField(type="string")},
-                    routes=[RouteDef(to="$end")],
-                ),
-            ],
-            output={"result": "{{ agent1.output.result }}"},
-        )
-
-        def mock_handler(agent, prompt, context):
-            return {"result": "done"}
-
-        provider = CopilotProvider(mock_handler=mock_handler)
-        engine = WorkflowEngine(config, provider)
-
-        result = await engine.run({})
-
-        assert result["result"] == "done"
-
-
 class TestWorkflowEngineContextTrimming:
     """Tests for context trimming integration in workflow engine."""
 
@@ -2820,6 +2678,7 @@ class _RecordingReasoningProvider:
         skill_directories=None,
         custom_agents=None,
         extra_mcp_servers=None,
+        continuation_state=None,
     ):
         from conductor.providers.base import AgentOutput
         from conductor.providers.reasoning import resolve_reasoning_effort
@@ -3504,8 +3363,6 @@ class TestWorkflowEngineTerminateAdditionalScenarios:
     - Terminate as a route target from a parallel group's routes and from a
       for_each group's routes (the main routing loop must dispatch to the
       terminate branch after the group completes).
-    - Lifecycle hooks (``on_complete`` for success, ``on_error`` for failed)
-      fire with the right arguments.
     """
 
     @pytest.mark.asyncio
@@ -3678,96 +3535,6 @@ class TestWorkflowEngineTerminateAdditionalScenarios:
         assert result == {"result": "from-for-each"}
 
     @pytest.mark.asyncio
-    async def test_on_complete_hook_fires_for_success_terminate(self) -> None:
-        """`on_complete` hook must fire when a terminate step ends with success.
-
-        Hooks are a public extension point; a refactor that dropped the
-        `_execute_hook("on_complete", ...)` call from the success-terminate
-        branch would silently regress every workflow that relies on the
-        hook for completion notifications.
-        """
-        from unittest.mock import patch as _patch
-
-        config = WorkflowConfig(
-            workflow=WorkflowDef(
-                name="hook-success",
-                entry_point="bye",
-                runtime=RuntimeConfig(provider="copilot"),
-                context=ContextConfig(mode="accumulate"),
-                limits=LimitsConfig(max_iterations=5),
-                hooks=HooksConfig(on_complete="completed: {{ result }}"),
-            ),
-            agents=[
-                AgentDef(
-                    name="bye",
-                    type="terminate",
-                    status="success",
-                    reason="all done",
-                    output_template={"r": "ok"},
-                ),
-            ],
-            output={},
-        )
-        engine = WorkflowEngine(config, CopilotProvider())
-        with _patch.object(engine, "_execute_hook", wraps=engine._execute_hook) as spy:
-            result = await engine.run({})
-        assert result == {"r": "ok"}
-        completion_calls = [
-            call for call in spy.call_args_list if call.args and call.args[0] == "on_complete"
-        ]
-        assert len(completion_calls) == 1, (
-            f"on_complete must fire exactly once; got: {spy.call_args_list}"
-        )
-        # The hook must receive the rendered output dict, not a raw template.
-        assert completion_calls[0].kwargs.get("result") == {"r": "ok"}
-
-    @pytest.mark.asyncio
-    async def test_on_error_hook_fires_for_failed_terminate(self) -> None:
-        """`on_error` hook must fire when a terminate step ends with failed.
-
-        The hook receives the `WorkflowTerminated` exception so authors can
-        notify on the structured `reason`/`terminated_by` rather than a
-        generic error message.
-        """
-        from unittest.mock import patch as _patch
-
-        from conductor.exceptions import WorkflowTerminated
-
-        config = WorkflowConfig(
-            workflow=WorkflowDef(
-                name="hook-error",
-                entry_point="abort",
-                runtime=RuntimeConfig(provider="copilot"),
-                context=ContextConfig(mode="accumulate"),
-                limits=LimitsConfig(max_iterations=5),
-                hooks=HooksConfig(on_error="failed: {{ error.message }}"),
-            ),
-            agents=[
-                AgentDef(
-                    name="abort",
-                    type="terminate",
-                    status="failed",
-                    reason="halt",
-                ),
-            ],
-            output={},
-        )
-        engine = WorkflowEngine(config, CopilotProvider())
-        with (
-            _patch.object(engine, "_execute_hook", wraps=engine._execute_hook) as spy,
-            pytest.raises(WorkflowTerminated),
-        ):
-            await engine.run({})
-        error_calls = [
-            call for call in spy.call_args_list if call.args and call.args[0] == "on_error"
-        ]
-        assert len(error_calls) == 1, f"on_error must fire exactly once; got: {spy.call_args_list}"
-        passed_error = error_calls[0].kwargs.get("error")
-        assert isinstance(passed_error, WorkflowTerminated)
-        assert passed_error.reason == "halt"
-        assert passed_error.terminated_by == "abort"
-
-    @pytest.mark.asyncio
     async def test_lifecycle_event_ordering_failed_terminate(self) -> None:
         """`agent_failed` must fire BEFORE `workflow_failed` for failed terminate.
 
@@ -3817,6 +3584,7 @@ class _RecordingWorkingDirProvider:
 
     def __init__(self) -> None:
         self.seen: list[tuple[str, str | None]] = []
+        self.seen_settings_dir: list[tuple[str, str | None]] = []
         self.calls: int = 0
 
     async def execute(
@@ -3830,9 +3598,11 @@ class _RecordingWorkingDirProvider:
         skill_directories=None,
         custom_agents=None,
         extra_mcp_servers=None,
+        continuation_state=None,
     ):
         self.calls += 1
         self.seen.append((agent.name, agent.working_dir))
+        self.seen_settings_dir.append((agent.name, agent.settings_dir))
         content = dict.fromkeys(agent.output or {}, f"{agent.name}-ok")
         return AgentOutput(
             content=content,
@@ -3856,6 +3626,7 @@ def _single_agent_config(
     *,
     working_dir: str | None = None,
     runtime_working_dir: str | None = None,
+    settings_dir: str | None = None,
     model: str = "gpt-4",
     max_tokens: int | None = None,
 ) -> WorkflowConfig:
@@ -3874,6 +3645,7 @@ def _single_agent_config(
                 model=model,
                 prompt="Do work",
                 working_dir=working_dir,
+                settings_dir=settings_dir,
                 output={"result": OutputField(type="string")},
                 routes=[RouteDef(to="$end")],
             ),
@@ -4615,3 +4387,530 @@ class TestWorkingDirEvents:
         envelope = [e for e in events if e.type == "for_each_item_started"]
         assert len(envelope) == 1
         assert envelope[0].data == {"group_name": "fans", "item_key": "0", "index": 0}
+
+
+class TestAgentSettingsDirResolution:
+    """Engine resolution of ``AgentDef.settings_dir``.
+
+    ``settings_dir`` selects the directory whose Claude Code *project*
+    settings tier an agent reads skills from. It is resolved exactly like
+    ``working_dir`` -- shared code, so the two cannot drift -- but is
+    deliberately independent of it: ``working_dir`` becomes the session cwd,
+    which the CLI advertises as its sole MCP root, whereas ``settings_dir``
+    only adds a tier to discover skills in. Keeping them separate is what
+    lets an agent hold a cwd wide enough for every path its MCP servers must
+    reach while still loading a narrower target repository's conventions.
+    """
+
+    @pytest.mark.asyncio
+    async def test_absolute_settings_dir_reaches_provider(self, tmp_path: Path) -> None:
+        """Requirement: the resolved directory is set on the ``AgentDef`` the
+        provider receives, which is where it becomes ``add_dirs``."""
+        target = tmp_path / "repo"
+        target.mkdir()
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir=str(target)),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({})
+
+        assert provider.seen_settings_dir == [("worker", os.path.normpath(str(target)))]
+
+    @pytest.mark.asyncio
+    async def test_settings_dir_does_not_become_working_dir(self, tmp_path: Path) -> None:
+        """The separation, asserted from the engine side.
+
+        An agent naming only ``settings_dir`` must leave ``working_dir``
+        unset, so the provider keeps its own cwd -- and with it the wide MCP
+        root. Coupling the two here would silently reintroduce the narrowing
+        the field exists to avoid.
+        """
+        target = tmp_path / "repo"
+        target.mkdir()
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir=str(target)),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({})
+
+        assert provider.seen == [("worker", None)]
+
+    @pytest.mark.asyncio
+    async def test_both_directories_resolve_independently(self, tmp_path: Path) -> None:
+        """The intended shape: a wide cwd and a narrow settings tier at once."""
+        wide = tmp_path / "wide"
+        narrow = wide / "repo"
+        narrow.mkdir(parents=True)
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(working_dir=str(wide), settings_dir=str(narrow)),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({})
+
+        assert provider.seen == [("worker", os.path.normpath(str(wide)))]
+        assert provider.seen_settings_dir == [("worker", os.path.normpath(str(narrow)))]
+
+    @pytest.mark.asyncio
+    async def test_templated_settings_dir_is_rendered(self, tmp_path: Path) -> None:
+        """Requirement: Jinja-rendered against the per-agent context, since the
+        directory a step reviews is normally an upstream step's output."""
+        target = tmp_path / "from-input"
+        target.mkdir()
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir="{{ workflow.input.target }}"),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({"target": str(target)})
+
+        assert provider.seen_settings_dir == [("worker", os.path.normpath(str(target)))]
+
+    @pytest.mark.asyncio
+    async def test_relative_settings_dir_resolves_against_workflow_dir(
+        self, tmp_path: Path
+    ) -> None:
+        """Requirement: relative paths resolve against the workflow file's
+        directory, not the process cwd -- matching ``working_dir``."""
+        (tmp_path / "sub").mkdir()
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir="./sub"),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        await engine.run({})
+
+        assert provider.seen_settings_dir == [("worker", os.path.normpath(str(tmp_path / "sub")))]
+
+    @pytest.mark.asyncio
+    async def test_missing_settings_dir_raises_before_the_provider_call(
+        self, tmp_path: Path
+    ) -> None:
+        """Requirement: a bad path fails fast and names its own field.
+
+        Naming ``settings_dir`` rather than ``working_dir`` is the point: the
+        two are resolved by shared code, and a message naming the wrong field
+        would send an author to correct a value that is already right.
+        """
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir=str(tmp_path / "nope")),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await engine.run({})
+
+        assert "settings_dir" in str(exc_info.value)
+        assert provider.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_a_template_rendering_empty_is_refused(self, tmp_path: Path) -> None:
+        """An empty render must not resolve to the workflow's own directory.
+
+        The schema rejects a literal blank, but a *template* can still render
+        empty at run time -- ``--input repo=``, a script step that printed
+        nothing, a ``set`` binding evaluating to "". ``Path("")`` is
+        ``Path(".")``, which is not absolute, so without this guard the value
+        would be joined onto the workflow file's directory, pass ``is_dir()``,
+        and be forwarded as a real ``add_dirs`` entry -- and the filesystem
+        grant is unconditional, so a value meaning "nothing" would hand the
+        model access to the workflow's own tree.
+        """
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir="{{ workflow.input.repo }}"),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await engine.run({"repo": ""})
+
+        assert "empty string" in str(exc_info.value)
+        assert "settings_dir" in str(exc_info.value)
+        assert provider.calls == 0
+
+    @pytest.mark.asyncio
+    async def test_an_empty_working_dir_render_is_refused_too(self, tmp_path: Path) -> None:
+        """The same guard covers ``working_dir``, and that is a deliberate change.
+
+        An empty-rendering ``working_dir`` previously resolved to the workflow
+        file's own directory and ran there -- the same "nothing means
+        something" footgun, just without the filesystem grant that makes the
+        ``settings_dir`` case dangerous. Pinned in its own right so a later
+        edit narrowing the guard to ``settings_dir`` cannot silently restore
+        it, and so the behaviour change is visible to anyone reading the tests.
+        """
+        provider = _RecordingWorkingDirProvider()
+        engine = WorkflowEngine(
+            _single_agent_config(working_dir="{{ workflow.input.repo }}"),
+            provider,
+            workflow_path=_workflow_file(tmp_path),
+        )
+
+        with pytest.raises(ExecutionError) as exc_info:
+            await engine.run({"repo": ""})
+
+        assert "empty string" in str(exc_info.value)
+        assert "working_dir" in str(exc_info.value)
+        assert provider.calls == 0
+
+
+class TestSettingsDirObservability:
+    """``settings_dir`` must appear in the events, on all three agent paths.
+
+    It is a trust decision, not a convenience: naming a directory loads
+    another repository's conventions *and* widens the model's built-in
+    ``Read``/``Edit``/``Bash`` to that tree. A grant that the dashboard and the
+    JSONL event log never mention cannot be audited after a run, so it rides
+    alongside ``working_dir`` wherever that is already emitted -- linear,
+    parallel-group and for-each. Pinning all three is the point: emitting it on
+    one path only would leave the other two silent about the same grant.
+    """
+
+    @pytest.mark.asyncio
+    async def test_agent_started_carries_settings_dir(self, tmp_path: Path) -> None:
+        target = tmp_path / "repo"
+        target.mkdir()
+        events: list[tuple[str, dict]] = []
+        engine = WorkflowEngine(
+            _single_agent_config(settings_dir=str(target)),
+            _RecordingWorkingDirProvider(),
+            workflow_path=_workflow_file(tmp_path),
+        )
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = [d for t, d in events if t == "agent_started"]
+        assert started, [t for t, _ in events]
+        assert started[0]["settings_dir"] == os.path.normpath(str(target))
+
+    @pytest.mark.asyncio
+    async def test_agent_started_reports_none_when_unset(self, tmp_path: Path) -> None:
+        """Absent rather than missing: a consumer can tell "no grant" from
+        "this Conductor did not report one"."""
+        events: list[tuple[str, dict]] = []
+        engine = WorkflowEngine(
+            _single_agent_config(),
+            _RecordingWorkingDirProvider(),
+            workflow_path=_workflow_file(tmp_path),
+        )
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = [d for t, d in events if t == "agent_started"]
+        assert started and "settings_dir" in started[0]
+        assert started[0]["settings_dir"] is None
+
+    @staticmethod
+    def _parallel_config(dir_a: Path, dir_b: Path) -> WorkflowConfig:
+        return WorkflowConfig(
+            workflow=WorkflowDef(
+                name="sd-ev-parallel",
+                entry_point="fan",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="member_a",
+                    model="gpt-4",
+                    prompt="A",
+                    settings_dir=str(dir_a),
+                    output={"r": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="member_b",
+                    model="gpt-4",
+                    prompt="B",
+                    settings_dir=str(dir_b) if dir_b else None,
+                    output={"r": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="fan",
+                    agents=["member_a", "member_b"],
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+            output={},
+        )
+
+    @pytest.mark.asyncio
+    async def test_parallel_agent_started_carries_settings_dir(self, tmp_path: Path) -> None:
+        """The parallel fan-out path, which the linear test cannot see.
+
+        Resolution and emission are different code paths: deleting the field
+        from this payload leaves ``provider.execute`` receiving the right
+        directory, so ``TestSettingsDirInGroups`` stays green while the event
+        goes silent.
+        """
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        events: list[tuple[str, dict]] = []
+        engine = WorkflowEngine(
+            self._parallel_config(dir_a, dir_b),
+            _RecordingWorkingDirProvider(),
+            workflow_path=_workflow_file(tmp_path),
+        )
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = [d for t, d in events if t == "parallel_agent_started"]
+        assert {d["agent_name"]: d["settings_dir"] for d in started} == {
+            "member_a": os.path.normpath(str(dir_a)),
+            "member_b": os.path.normpath(str(dir_b)),
+        }, started
+
+    @pytest.mark.asyncio
+    async def test_parallel_agent_started_reports_none_when_unset(self, tmp_path: Path) -> None:
+        """Negative control, matching ``TestWorkingDirEvents``' own pattern."""
+        dir_a = tmp_path / "a"
+        dir_a.mkdir()
+        config = self._parallel_config(dir_a, None)  # type: ignore[arg-type]
+        events: list[tuple[str, dict]] = []
+        engine = WorkflowEngine(
+            config, _RecordingWorkingDirProvider(), workflow_path=_workflow_file(tmp_path)
+        )
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = {d["agent_name"]: d for t, d in events if t == "parallel_agent_started"}
+        assert started["member_b"]["settings_dir"] is None
+        assert started["member_a"]["settings_dir"] == os.path.normpath(str(dir_a))
+
+    @pytest.mark.asyncio
+    async def test_for_each_agent_started_carries_settings_dir_per_item(
+        self, tmp_path: Path
+    ) -> None:
+        """The for-each path, per iteration.
+
+        This is where a templated ``settings_dir`` most needs auditing: the
+        value varies per item, so an event omitting it makes the grant
+        unauditable exactly where it changes.
+        """
+        for name in ("one", "two"):
+            (tmp_path / name).mkdir()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="sd-ev-for-each",
+                entry_point="lister",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="lister",
+                    model="gpt-4",
+                    prompt="List",
+                    output={"repos": OutputField(type="array")},
+                    routes=[RouteDef(to="fans")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="fans",
+                    type="for_each",
+                    source="lister.output.repos",
+                    **{"as": "repo"},
+                    agent=AgentDef(
+                        name="fan_agent",
+                        model="gpt-4",
+                        prompt="Work {{ repo }}",
+                        settings_dir=str(tmp_path / "{{ repo }}"),
+                        output={"r": OutputField(type="string")},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        events: list[tuple[str, dict]] = []
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            content = {"repos": ["one", "two"]} if agent.name == "lister" else {"r": "ok"}
+            return AgentOutput(
+                content=content,
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider = _RecordingWorkingDirProvider()
+        provider.execute = _execute  # type: ignore[method-assign]
+        engine = WorkflowEngine(config, provider, workflow_path=_workflow_file(tmp_path))
+        engine._emit = lambda t, d=None: events.append((t, d or {}))  # type: ignore[method-assign]
+
+        await engine.run({})
+
+        started = [d for t, d in events if t == "for_each_agent_started"]
+        assert sorted(d["settings_dir"] for d in started) == sorted(
+            [os.path.normpath(str(tmp_path / "one")), os.path.normpath(str(tmp_path / "two"))]
+        ), started
+
+
+class TestSettingsDirInGroups:
+    """``settings_dir`` must resolve inside parallel groups and for-each loops.
+
+    All three agent paths route through ``_resolve_agent_working_dir``, so the
+    field does reach them -- but nothing pinned that, and the for-each site is
+    the one where a per-iteration template (``{{ item }}``) is most likely to
+    be used. It resolves *after* loop-variable injection, an ordering a future
+    refactor of the for-each body could break with no test to notice: the
+    agent would then silently load a different iteration's skills.
+    """
+
+    @pytest.mark.asyncio
+    async def test_for_each_resolves_settings_dir_per_iteration(self, tmp_path: Path) -> None:
+        for name in ("one", "two"):
+            (tmp_path / name).mkdir()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="sd-for-each",
+                entry_point="lister",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="lister",
+                    model="gpt-4",
+                    prompt="List",
+                    output={"repos": OutputField(type="array")},
+                    routes=[RouteDef(to="fans")],
+                ),
+            ],
+            for_each=[
+                ForEachDef(
+                    name="fans",
+                    type="for_each",
+                    source="lister.output.repos",
+                    **{"as": "repo"},
+                    agent=AgentDef(
+                        name="fan_agent",
+                        model="gpt-4",
+                        prompt="Work {{ repo }}",
+                        settings_dir=str(tmp_path / "{{ repo }}"),
+                        output={"r": OutputField(type="string")},
+                    ),
+                    routes=[RouteDef(to="$end")],
+                ),
+            ],
+            output={},
+        )
+        seen: list[tuple[str, str | None]] = []
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            if agent.name == "lister":
+                return AgentOutput(
+                    content={"repos": ["one", "two"]},
+                    raw_response=None,
+                    model=agent.model,
+                    input_tokens=1,
+                    output_tokens=1,
+                )
+            seen.append((agent.name, agent.settings_dir))
+            return AgentOutput(
+                content={"r": "ok"},
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider = _RecordingWorkingDirProvider()
+        provider.execute = _execute  # type: ignore[method-assign]
+        engine = WorkflowEngine(config, provider, workflow_path=_workflow_file(tmp_path))
+
+        await engine.run({})
+
+        assert sorted(d for _, d in seen) == sorted(
+            [os.path.normpath(str(tmp_path / "one")), os.path.normpath(str(tmp_path / "two"))]
+        ), seen
+
+    @pytest.mark.asyncio
+    async def test_parallel_member_resolves_its_own_settings_dir(self, tmp_path: Path) -> None:
+        dir_a = tmp_path / "a"
+        dir_b = tmp_path / "b"
+        dir_a.mkdir()
+        dir_b.mkdir()
+        config = WorkflowConfig(
+            workflow=WorkflowDef(
+                name="sd-parallel",
+                entry_point="fan",
+                runtime=RuntimeConfig(provider="claude-agent-sdk"),
+                context=ContextConfig(mode="accumulate"),
+                limits=LimitsConfig(max_iterations=10),
+            ),
+            agents=[
+                AgentDef(
+                    name="member_a",
+                    model="gpt-4",
+                    prompt="A",
+                    settings_dir=str(dir_a),
+                    output={"r": OutputField(type="string")},
+                ),
+                AgentDef(
+                    name="member_b",
+                    model="gpt-4",
+                    prompt="B",
+                    settings_dir=str(dir_b),
+                    output={"r": OutputField(type="string")},
+                ),
+            ],
+            parallel=[
+                ParallelGroup(
+                    name="fan",
+                    agents=["member_a", "member_b"],
+                    routes=[RouteDef(to="$end")],
+                )
+            ],
+            output={},
+        )
+        seen: list[tuple[str, str | None]] = []
+
+        async def _execute(agent, context, rendered_prompt, tools=None, **kwargs):
+            seen.append((agent.name, agent.settings_dir))
+            return AgentOutput(
+                content={"r": "ok"},
+                raw_response=None,
+                model=agent.model,
+                input_tokens=1,
+                output_tokens=1,
+            )
+
+        provider = _RecordingWorkingDirProvider()
+        provider.execute = _execute  # type: ignore[method-assign]
+        engine = WorkflowEngine(config, provider, workflow_path=_workflow_file(tmp_path))
+
+        await engine.run({})
+
+        assert sorted(seen) == [
+            ("member_a", os.path.normpath(str(dir_a))),
+            ("member_b", os.path.normpath(str(dir_b))),
+        ], seen

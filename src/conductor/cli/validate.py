@@ -6,6 +6,7 @@ without executing them, displaying detailed error information.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -16,6 +17,8 @@ from rich.text import Text
 from conductor.config.loader import load_config
 from conductor.console import MarkupFreeConsole, make_console, styled
 from conductor.exceptions import ConductorError
+from conductor.install_hint import install_command
+from conductor.telemetry.guards import OTEL_SDK_AVAILABLE
 
 if TYPE_CHECKING:
     from conductor.config.schema import WorkflowConfig
@@ -70,8 +73,23 @@ def validate_workflow(
 
     _report_skill_discovery(config, workflow_path, output_console, already_reported=warnings)
     _report_plugins(config, workflow_path, output_console)
+    _report_mcp(config, output_console)
+    _report_telemetry_sdk(output_console)
 
     return True, config
+
+
+def _report_telemetry_sdk(console: MarkupFreeConsole) -> None:
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT", "").strip()
+    traces_endpoint = os.environ.get("OTEL_EXPORTER_OTLP_TRACES_ENDPOINT", "").strip()
+    if (endpoint or traces_endpoint) and not OTEL_SDK_AVAILABLE:
+        console.print(
+            styled(
+                "  [yellow]⚠[/yellow] An OTLP endpoint is set but the telemetry extra is "
+                "not installed. Install it with: {}",
+                install_command("telemetry"),
+            )
+        )
 
 
 def _report_plugins(
@@ -114,11 +132,16 @@ def _report_plugins(
     from conductor.plugins.errors import PluginError, PluginFetchError
     from conductor.plugins.registry import resolve_plugins
     from conductor.plugins.resolution import marketplaces_from, resolve_plugin_sources
+    from conductor.providers.capabilities import plugin_flavor_for
     from conductor.skills import SkillError
 
     base_dir = workflow_path.resolve().parent
     declared = config.workflow.runtime.plugin_sources
     sources: dict[str, Any] = {}
+    # The workflow-level default provider's flavor, since this reports the
+    # workflow-level ``runtime.plugins`` list only (see the docstring) —
+    # there is no single per-agent flavor to prefer here.
+    flavor = plugin_flavor_for(config.workflow.runtime.provider.name)
     if declared:
         # Cache-only, like everything else in ``conductor validate``: this
         # is a summary, and a summary must not clone. Resolved one at a
@@ -166,6 +189,10 @@ def _report_plugins(
                     base_dir=base_dir,
                     marketplaces=marketplaces_from(sources),
                     declared_sources=set(declared) - set(sources),
+                    on_warning=lambda message: console.print(
+                        styled("  [yellow]⚠[/yellow] {}", message)
+                    ),
+                    flavor=flavor,
                 )
             )
         except (PluginError, SkillError, OSError) as exc:
@@ -195,6 +222,39 @@ def _report_plugins(
             console.print(
                 styled("      [dim]disabled by this workflow: {}[/dim]", ", ".join(plugin.disabled))
             )
+
+
+def _report_mcp(
+    config: WorkflowConfig,
+    console: MarkupFreeConsole,
+) -> None:
+    """Print the effective ``mcp:`` block and the tool name it would publish.
+
+    Unlike ``_report_plugins``/``_report_skill_discovery``, this always
+    prints: default-on exposure (DD4) means every workflow is a candidate for
+    ``conductor mcp serve``, so there is no "nothing enabled" case to skip.
+    Making the generated tool name inspectable without attaching an MCP host
+    at all is the point (FR11) — a rename that silently changes (or breaks)
+    the published name should be visible at ``conductor validate`` time.
+
+    Args:
+        config: The validated workflow configuration.
+        console: Rich console for output.
+    """
+    from conductor.config.validator import slugify_workflow_name
+
+    mcp = config.workflow.mcp
+    tool_name = slugify_workflow_name(config.workflow.name)
+
+    console.print(styled("  [dim]MCP: tool name would be '{}'[/dim]", tool_name))
+    detail = [
+        f"expose={mcp.expose}",
+        f"mode={mcp.mode}",
+        f"read_only={mcp.read_only}",
+        f"destructive={mcp.destructive}",
+        f"estimated_minutes={mcp.estimated_minutes}",
+    ]
+    console.print(styled("    [dim]{}[/dim]", ", ".join(detail)))
 
 
 def _report_skill_discovery(

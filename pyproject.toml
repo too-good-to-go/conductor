@@ -1,6 +1,6 @@
 [project]
 name = "conductor-cli"
-version = "0.1.33"
+version = "0.1.37"
 description = "A CLI tool for defining and running multi-agent workflows with the GitHub Copilot SDK"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -39,9 +39,23 @@ dependencies = [
     "simpleeval>=1.0.0",
     "github-copilot-sdk>=1.0.9",
     "anthropic>=0.77.0,<1.0.0",
-    "pydantic-ai-slim[anthropic,openai]>=1.44.0",
+    "pydantic-ai-slim[anthropic,openai]>=2.28.0,<3",
+    # Upper-bounded below 0.25: the compaction wrapper relies on harness
+    # internals that are private contract, not public API — `TieredCompaction.
+    # _escalate` calls each tier's compact directly without catching
+    # exceptions, the `max_messages=1` placeholder is used for outer-gated
+    # tiers, and `estimate_context_tokens` anchoring semantics are load-bearing.
+    "pydantic-ai-harness>=0.22.0,<0.25",
+    # Direct dependency: imported at runtime by
+    # `providers/_pydantic_ai/compaction_window.py` but previously arrived only
+    # transitively via pydantic-ai-harness.
+    "genai-prices>=0.1.4",
     "openai>=2.48.0,<3.0.0",
-    "mcp>=1.28.1",
+    # Upper-bounded below 2.0.0: 2.0.0 renamed the camelCase attributes
+    # (e.g. `Tool.inputSchema` -> `input_schema`) that the existing MCP
+    # client (`mcp/manager.py:207`) reads, which would raise AttributeError
+    # on every server connection with no ImportError to catch it.
+    "mcp>=1.28.1,<2",
     "fastapi>=0.115.0",
     "uvicorn>=0.30.0",
     "websockets>=12.0",
@@ -52,6 +66,7 @@ dependencies = [
     # version predating the IDNA 2008 host name matching fix in TLSStream.wrap()
     # (agronholm/anyio#1208). See FN-5092.
     "anyio>=4.14.2",
+    "opentelemetry-api>=1.20",
     # Timeout-bounded regex matching for output field constraints and provider
     # response normalization. Ships typed stubs and supports per-match deadlines.
     "regex>=2024.11.6",
@@ -78,6 +93,11 @@ tui = [
     # `App.run_test()` / `Pilot` behavior every TUI pilot test depends on
     # changed before it.
     "textual>=8.0",
+]
+telemetry = [
+    "opentelemetry-sdk>=1.20",
+    "opentelemetry-exporter-otlp-proto-grpc>=1.20",
+    "opentelemetry-exporter-otlp-proto-http>=1.20",
 ]
 
 [project.urls]

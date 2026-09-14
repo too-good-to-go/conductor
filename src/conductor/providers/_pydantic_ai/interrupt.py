@@ -19,7 +19,7 @@ import asyncio
 import contextlib
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -36,6 +36,7 @@ from conductor.providers._pydantic_ai.events import (
     emit_pydantic_event,
 )
 from conductor.providers._pydantic_ai.usage import last_request_input_tokens
+from conductor.telemetry import guards
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,7 @@ async def run_with_interrupt(
     usage_limits: UsageLimits | None = None,
     max_session_seconds: float | None = None,
     max_parse_recovery_attempts: int = 0,
+    message_history: Sequence[ModelMessage] | None = None,
 ) -> RunOutcome:
     """Run a Pydantic AI agent with Conductor interrupt support.
 
@@ -210,6 +212,8 @@ async def run_with_interrupt(
             non-retryable ``ProviderError`` is raised.
         max_parse_recovery_attempts: Configured output-correction budget used
             in ``agent_parse_recovery`` event payloads.
+        message_history: Optional completed-run messages to continue before
+            adding ``user_prompt`` as the next user turn.
 
     Returns:
         A ``RunOutcome`` describing normal completion, partial output, or
@@ -220,14 +224,21 @@ async def run_with_interrupt(
     if interrupt_signal.is_set():
         logger.info("Pydantic AI agent interrupted before first iteration")
         interrupt_signal.clear()
-        return await _request_partial_output(agent, [], event_callback, has_output_schema)
+        return await _request_partial_output(
+            agent, list(message_history or []), event_callback, has_output_schema
+        )
 
     recovery_attempt = [0]
     iteration = 0
     session_start = time.monotonic()
 
     try:
-        async with agent.iter(user_prompt, usage_limits=usage_limits) as run:
+        async with agent.iter(
+            user_prompt,
+            usage_limits=usage_limits,
+            message_history=message_history,
+            conversation_id=guards.current_run_id(),
+        ) as run:
             next_node = run.next_node
             while not isinstance(next_node, End):
                 iteration += 1
@@ -350,6 +361,7 @@ async def _request_partial_output(
             user_prompt=None,
             message_history=partial_history,
             output_type=str,
+            conversation_id=guards.current_run_id(),
         )
     return RunOutcome(
         partial_output=result.output,

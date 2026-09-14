@@ -4,6 +4,11 @@ Conductor supports [Model Context Protocol (MCP)](https://modelcontextprotocol.i
 
 MCP servers are configured at the workflow level and made available to all agents. Each agent can optionally filter which tools it uses.
 
+> **This page is about Conductor *calling* MCP tools.** For the mirror
+> image — Conductor *being* an MCP server, exposing your workflows as
+> tools to Claude Code, VS Code, Cursor, or any other MCP host — see
+> [MCP Server](mcp-server.md).
+
 ## Quick Start
 
 Add an MCP server to your workflow's `runtime` section:
@@ -90,6 +95,31 @@ mcp_servers:
 The configuration fields are the same as `http`.
 
 > **Provider note:** The Claude provider only supports `stdio` servers. The `http` and `sse` types are supported by the Copilot and Claude Agent SDK providers.
+
+## Direct MCP Steps
+
+Conductor supports two distinct ways to execute MCP tools:
+
+1. **LLM-driven tool calling:** An AI agent receives tool definitions from configured `mcp_servers` and autonomously chooses which tools to call and what arguments to supply.
+2. **Direct MCP steps (`type: mcp`):** A deterministic workflow step invokes an MCP tool directly with authored arguments, without involving an LLM.
+
+Direct MCP steps run deterministically, spend zero LLM tokens, and capture structured result envelopes (`content`, `structured`, `is_error`) directly into the workflow context. This enables explicit routing on tool outputs and errors.
+
+```yaml
+agents:
+  - name: fetch_file
+    type: mcp
+    server: filesystem
+    tool: read_file
+    arguments:
+      path: "config.json"
+    routes:
+      - to: handle_error
+        when: "{{ output.is_error }}"
+      - to: parse_config
+```
+
+Direct MCP steps are provider-independent (they work with any provider or even without an LLM provider configured) and execute on `stdio` MCP servers. See [Workflow Syntax: MCP Steps](workflow-syntax.md#mcp-steps) for the complete reference on arguments, envelope merging, and routing semantics.
 
 ## Configuration Reference
 
@@ -435,6 +465,8 @@ agents:
 
 ## See Also
 
+- [MCP Server](mcp-server.md) — the mirror image: exposing Conductor
+  workflows as MCP tools via `conductor mcp serve`
 - [Workflow Syntax Reference](workflow-syntax.md) — agent `tools` field
 - [Configuration Guide](configuration.md) — runtime configuration
 - [Provider Comparison](providers/comparison.md) — feature comparison

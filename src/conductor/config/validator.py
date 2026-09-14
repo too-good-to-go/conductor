@@ -17,6 +17,7 @@ from jinja2 import Environment, meta, nodes
 
 from conductor.exceptions import ConfigurationError
 from conductor.plugins.errors import PluginError, PluginSourceUnavailableError
+from conductor.plugins.manifest import PluginFlavor
 from conductor.plugins.registry import describe_dropped_components, resolve_plugins
 from conductor.providers.capabilities import (
     ProviderCapabilities,
@@ -431,6 +432,16 @@ def validate_workflow_config(
     errors.extend(cap_errors)
     warnings.extend(cap_warnings)
 
+    # Cross-check the workflow against the MCP exposure ladder (DD4, E6).
+    # Unconditional: default-on exposure means every workflow is a candidate.
+    errors.extend(_validate_mcp_exposure(config))
+
+    # Static half of the ``type: mcp`` step checks. ``conductor run`` never
+    # calls this validator, so the same rules (plus actual tool existence on
+    # the server) are enforced again at runtime; this is early off-network
+    # diagnostics for ``conductor validate`` only.
+    errors.extend(_validate_mcp_steps(config))
+
     if errors:
         raise ConfigurationError(
             "Workflow configuration validation failed:\n  - " + "\n  - ".join(errors),
@@ -581,6 +592,146 @@ def _validate_tool_references(
                 f"Agent '{agent_name}' references unknown tool '{tool}'. "
                 f"Available tools: {', '.join(sorted(workflow_tools))}"
             )
+
+    return errors
+
+
+# The reserved parameter the MCP tool generator (E7) injects into every
+# generated tool's inputSchema (FR5). A workflow input of this name would be
+# silently shadowed by it, so it is rejected here rather than at build time.
+MCP_RESERVED_WAIT_SECONDS_INPUT = "_wait_seconds"
+
+# MCP `2026-07-28` recommends tool names 1-128 characters drawn from
+# `A-Za-z0-9_-.`. This matches every character *not* in that set.
+_MCP_TOOL_NAME_DISALLOWED_CHARS = re.compile(r"[^a-z0-9_.\-]")
+
+_MCP_TOOL_NAME_MIN_LENGTH = 1
+_MCP_TOOL_NAME_MAX_LENGTH = 128
+
+
+def slugify_workflow_name(name: str) -> str:
+    """Slugify a workflow name into the MCP tool-name charset.
+
+    Mirrors the tool generator's rule
+    (``docs/projects/mcp-server/conductor-mcp.design.md``, API Contracts →
+    Workflow tool): lowercase the name, map every character outside
+    ``A-Za-z0-9_-.`` to ``_``, then additionally fold ``-`` to ``_`` so the
+    result matches Conductor's own snake_case convention. Substitution
+    replaces one character with one character, so the slug's length never
+    exceeds the source name's length after lowercasing (Unicode lowercasing
+    can itself expand a string's length, e.g. ``"İ"`` -> ``"i̇"``); see
+    :func:`_validate_mcp_exposure` for how that bounds the slug's length
+    check against the source name.
+    """
+    lowered = name.lower()
+    replaced = _MCP_TOOL_NAME_DISALLOWED_CHARS.sub("_", lowered)
+    return replaced.replace("-", "_")
+
+
+def _validate_mcp_exposure(config: WorkflowConfig) -> list[str]:
+    """Cross-check the workflow against the always-on MCP exposure ladder (DD4).
+
+    Both checks fire regardless of whether the workflow declares an ``mcp:``
+    block: default-on exposure means every workflow is a candidate for
+    ``conductor mcp serve``, so a workflow that would fail at tool-generation
+    time must fail here first.
+
+    Returns:
+        List of error messages.
+    """
+    errors: list[str] = []
+
+    if MCP_RESERVED_WAIT_SECONDS_INPUT in config.workflow.input:
+        errors.append(
+            f"Workflow input '{MCP_RESERVED_WAIT_SECONDS_INPUT}' collides with "
+            "the reserved parameter the MCP tool generator injects into every "
+            "generated tool's schema (FR5). Rename this input."
+        )
+
+    slug = slugify_workflow_name(config.workflow.name)
+    if not _MCP_TOOL_NAME_MIN_LENGTH <= len(slug) <= _MCP_TOOL_NAME_MAX_LENGTH:
+        errors.append(
+            f"Workflow name {config.workflow.name!r} cannot be slugified into a "
+            f"legal MCP tool name ({_MCP_TOOL_NAME_MIN_LENGTH}-"
+            f"{_MCP_TOOL_NAME_MAX_LENGTH} characters drawn from 'A-Za-z0-9_-.'); "
+            "rename the workflow."
+        )
+
+    return errors
+
+
+def _validate_mcp_steps(config: WorkflowConfig) -> list[str]:
+    """Validate ``type: mcp`` step server/tool references.
+
+    Checks that each mcp step's ``server`` is declared in
+    ``workflow.runtime.mcp_servers``, that the server's ``tools`` filter
+    allows the step's ``tool``, and that the server is a stdio server
+    (http/sse support is not implemented yet). Inline for-each agents are
+    walked explicitly since they are absent from ``config.agents``;
+    parallel-group members are names into ``config.agents`` and covered by
+    that list. This is the static half of the checks only — ``conductor
+    run`` never calls this validator, so the engine repeats them at runtime
+    (plus actual tool existence on the server).
+
+    Returns:
+        List of error messages.
+    """
+    errors: list[str] = []
+    servers = config.workflow.runtime.mcp_servers
+
+    # (agent, enclosing for_each group name or None)
+    mcp_agents: list[tuple[AgentDef, str | None]] = [
+        (agent, None) for agent in config.agents if agent.type == "mcp"
+    ]
+    mcp_agents += [(fe.agent, fe.name) for fe in config.for_each if fe.agent.type == "mcp"]
+
+    for agent, for_each_group in mcp_agents:
+        label = (
+            f"Agent '{agent.name}'"
+            if for_each_group is None
+            else f"Agent '{agent.name}' in for-each group '{for_each_group}'"
+        )
+        if agent.server is None or agent.tool is None:
+            # Schema validation already rejects mcp agents without
+            # server/tool; this guard only narrows the types below.
+            continue
+        server_def = servers.get(agent.server)
+        if server_def is None:
+            available = ", ".join(sorted(servers)) or "(none declared)"
+            errors.append(
+                f"{label} references unknown MCP server '{agent.server}'. "
+                f"Available servers: {available}"
+            )
+            continue
+        if "*" not in server_def.tools and agent.tool not in server_def.tools:
+            errors.append(
+                f"{label} uses tool '{agent.tool}' which is not allowed by "
+                f"server '{agent.server}' tools filter "
+                f"({', '.join(server_def.tools)}). Add the tool to the server's "
+                'tools list or use ["*"] to allow all tools.'
+            )
+        if server_def.type != "stdio":
+            errors.append(
+                f"{label}: type: mcp supports stdio servers only "
+                f"(got '{server_def.type}'); http/sse support is not implemented yet"
+            )
+
+        # Syntax-check every argument template explicitly. Reference
+        # analysis (_extract_template_refs) deliberately swallows
+        # TemplateSyntaxError (semantic validation must not hard-fail on
+        # templates render-time would report), so without this pass a
+        # malformed nested argument like '{{ workflow.input.foo' would pass
+        # `conductor validate` and only fail at execution.
+        for source_label, template_str in _collect_argument_strings(
+            f"{label} arguments", agent.arguments
+        ):
+            try:
+                _JINJA_ENV.parse(template_str)
+            except jinja2.TemplateSyntaxError as exc:
+                errors.append(
+                    f"{source_label}: invalid Jinja2 template syntax: {exc.message} "
+                    f"(line {exc.lineno})"
+                )
 
     return errors
 
@@ -744,11 +895,12 @@ def _validate_parallel_groups(config: WorkflowConfig) -> list[str]:
                             "on each other."
                         )
 
-            # For 'set' steps, also walk value/values.* templates — they can
-            # reference siblings directly without declaring them in input:.
+            # For 'set' and 'mcp' steps, also walk their value/values.*
+            # (resp. arguments.*) templates — they can reference siblings
+            # directly without declaring them in input:.
             # Parallel execution uses a pre-group snapshot, so any reference
             # to a same-group member would silently miss its output.
-            if agent.type == "set":
+            if agent.type in ("set", "mcp"):
                 for source_label, template_str in _collect_template_strings(agent):
                     refs = _extract_template_refs(template_str)
                     cross_refs = refs.agent_refs & pg_agents_set
@@ -1183,6 +1335,25 @@ def _validate_output_path_coverage(config: WorkflowConfig) -> list[str]:
     return warnings
 
 
+def _collect_argument_strings(label: str, value: Any) -> list[tuple[str, str]]:
+    """Recursively collect string leaves of an ``arguments`` value.
+
+    Dict keys extend the dot-joined label (``arguments.<key>``); list items
+    use index labels (``arguments.<key>[<i>]``). Non-string scalars pass
+    through untouched — only rendered strings can carry template references.
+    """
+    collected: list[tuple[str, str]] = []
+    if isinstance(value, dict):
+        for key, item in value.items():
+            collected.extend(_collect_argument_strings(f"{label}.{key}", item))
+    elif isinstance(value, list):
+        for i, item in enumerate(value):
+            collected.extend(_collect_argument_strings(f"{label}[{i}]", item))
+    elif isinstance(value, str):
+        collected.append((label, value))
+    return collected
+
+
 def _collect_template_strings(
     agent: AgentDef,
 ) -> list[tuple[str, str]]:
@@ -1203,6 +1374,11 @@ def _collect_template_strings(
         templates.append((f"agent '{agent.name}' args[{i}]", arg))
     if agent.working_dir:
         templates.append((f"agent '{agent.name}' working_dir", agent.working_dir))
+    # getattr for the same reason the 'set' bindings below use it: duck-typed
+    # test fixtures predate this field and would raise on direct access.
+    settings_dir = getattr(agent, "settings_dir", None)
+    if settings_dir:
+        templates.append((f"agent '{agent.name}' settings_dir", settings_dir))
 
     # 'set' step bindings — value: single expression, values: named expressions.
     # Use getattr so duck-typed test fixtures without these attributes still
@@ -1214,6 +1390,13 @@ def _collect_template_strings(
     if values:
         for key, expr in values.items():
             templates.append((f"agent '{agent.name}' values.{key}", expr))
+
+    # 'mcp' step arguments — values are Jinja2-rendered at runtime, including
+    # string leaves nested in dicts/lists, so collect them recursively to
+    # catch stale references at validate-time like every other rendered field.
+    arguments: dict[str, Any] | None = getattr(agent, "arguments", None)
+    if arguments:
+        templates.extend(_collect_argument_strings(f"agent '{agent.name}' arguments", arguments))
 
     # input_mapping is on AgentDef in main (added by #109 closing #101) but may not
     # exist on the schema in branches that haven't merged that yet. getattr keeps
@@ -1694,7 +1877,7 @@ def _validate_template_references(
                 elif (
                     is_explicit
                     and agent.type
-                    not in ("script", "set", "workflow", "human_gate", "questions", "wait")
+                    not in ("script", "set", "workflow", "human_gate", "questions", "wait", "mcp")
                     and input_name not in declared_workflow_inputs
                 ):
                     warnings.append(
@@ -1736,6 +1919,25 @@ _LLM_AGENT_TYPES = frozenset({None, "agent"})
 def _is_llm_agent(agent: AgentDef) -> bool:
     """True iff this agent invokes a provider (vs. human_gate, script, etc.)."""
     return agent.type in _LLM_AGENT_TYPES
+
+
+def _project_tier_enabled(config: WorkflowConfig, agent: AgentDef) -> bool:
+    """True iff this agent's session will enable the ``project`` settings tier.
+
+    ``settings_dir`` feeds the ``project`` tier and nothing else, so any tier
+    is not enough: ``user`` reads ``~/.claude`` and ``local`` is cwd-bound, so
+    neither can make a ``settings_dir``'s skills discoverable. A per-agent
+    ``skills: []`` opts the agent out of the tiers entirely
+    (``claude_agent_sdk.py::execute`` computes ``effective_sources`` that way),
+    so the check is per agent rather than per workflow.
+
+    ``runtime.provider`` is either the bare string shorthand (no tiers, by
+    definition) or a ``ProviderSettings`` carrying ``setting_sources``.
+    """
+    if agent.skills == []:
+        return False
+    provider = config.workflow.runtime.provider
+    return "project" in (getattr(provider, "setting_sources", None) or [])
 
 
 def _resolved_provider_name(agent: AgentDef, default: str) -> str:
@@ -1821,6 +2023,8 @@ def _validate_provider_capabilities(
     # no matter where future call sites are added.
     runtime_default_effort = config.workflow.runtime.default_reasoning_effort
     runtime_max_session_seconds = config.workflow.runtime.max_session_seconds
+    runtime_idle_timeout_seconds = config.workflow.runtime.idle_timeout_seconds
+    runtime_max_idle_recovery_attempts = config.workflow.runtime.max_idle_recovery_attempts
     runtime_working_dir = config.workflow.runtime.working_dir
     runtime_skills = config.workflow.runtime.skills
     skill_limits = config.workflow.runtime.skill_injection
@@ -1836,10 +2040,14 @@ def _validate_provider_capabilities(
     ] = {}
     runtime_plugins = config.workflow.runtime.plugins
     # Keyed by the entries themselves (name plus the three component
-    # switches), because resolving a plugin walks its skills tree and parses
-    # every agent definition it ships. A ``str`` value is a cached failure.
+    # switches) *and* the requesting provider's plugin flavor: resolving a
+    # plugin walks its skills tree and parses every agent definition it
+    # ships, and two agents on different providers naming the same entry
+    # list can resolve to different builds (issue #497) — sharing one
+    # cache slot between them served the first agent's provider's answer
+    # to the second. A ``str`` value is a cached failure.
     plugin_cache: dict[
-        tuple[tuple[str, bool, bool, bool], ...],
+        tuple[tuple[tuple[str, bool, bool, bool], ...], PluginFlavor | None],
         list[ResolvedPlugin] | str | _DeferredPluginCheck,
     ] = {}
     (
@@ -2113,7 +2321,8 @@ def _validate_provider_capabilities(
                 if not entries:
                     return
 
-        key = tuple((e.name, e.skills, e.agents, e.mcp) for e in entries)
+        flavor = caps.plugin_flavor
+        key = (tuple((e.name, e.skills, e.agents, e.mcp) for e in entries), flavor)
         if key not in plugin_cache:
             try:
                 plugin_cache[key] = resolve_plugins(
@@ -2126,6 +2335,7 @@ def _validate_provider_capabilities(
                     # command that fails on the same input.
                     declared_sources=unavailable_sources,
                     on_warning=warnings.append,
+                    flavor=flavor,
                 )
             except PluginSourceUnavailableError as exc:
                 # The one plugin failure that is not a problem with the
@@ -2383,6 +2593,58 @@ def _validate_provider_capabilities(
                 f"directories (capabilities.working_dir=False)."
             )
 
+        # settings_dir: same class as working_dir. A provider with nowhere to
+        # put the directory would load the wrong repository's conventions and
+        # report success, so this is an error rather than a dropped field.
+        if agent.settings_dir is not None and not caps.settings_dir:
+            errors.append(
+                f"Agent '{agent.name}' sets settings_dir={agent.settings_dir!r} "
+                f"but provider '{provider_name}' does not apply it "
+                f"(capabilities.settings_dir=False). Only 'claude-agent-sdk' "
+                f"has a surface for it; use working_dir, or move this agent to "
+                f"that provider."
+            )
+        elif agent.settings_dir is not None and not _project_tier_enabled(config, agent):
+            # A warning, not an error: the FILESYSTEM half of settings_dir
+            # applies regardless, so the workflow is not broken -- but the
+            # skill discovery it is normally set for is a no-op without the
+            # project tier enabled, and a green validate would imply otherwise.
+            #
+            # Three distinct causes, each with a different remedy (or none), so
+            # the message branches rather than prescribing one fix that may be
+            # impossible to apply.
+            common = (
+                f"Agent '{agent.name}' sets settings_dir={agent.settings_dir!r} but "
+                f"its session will not enable the 'project' settings tier, so no "
+                f"skills will be discovered from that directory. The directory is "
+                f"still granted to the model's built-in file tools."
+            )
+            if agent.skills == []:
+                warnings.append(
+                    f"{common} The agent's own 'skills: []' opts it out of the "
+                    f"settings tiers entirely. Remove it to let the tier apply, or "
+                    f"remove settings_dir if the filesystem grant was not intended."
+                )
+            elif provider_name != default_provider:
+                # setting_sources lives on the single workflow-level
+                # ProviderSettings and the schema rejects it unless that
+                # provider is claude-agent-sdk, so telling this author to add
+                # it would produce a ValidationError.
+                warnings.append(
+                    f"{common} The settings tier is workflow-scoped "
+                    f"(runtime.provider.setting_sources) and cannot be enabled for "
+                    f"an agent that overrides its provider, since the schema "
+                    f"accepts setting_sources only when runtime.provider is "
+                    f"'claude-agent-sdk' (it is {default_provider!r}). Move "
+                    f"the provider to runtime.provider to enable the tier, or keep "
+                    f"settings_dir for the filesystem grant alone."
+                )
+            else:
+                warnings.append(
+                    f"{common} Add 'project' to runtime.provider.setting_sources to "
+                    f"load that repository's skills."
+                )
+
         # session_key: a provider that ignores it starts a fresh session every
         # execution, silently discarding the context the author asked to keep.
         if agent.session_key is not None and not caps.session_continuity:
@@ -2471,6 +2733,36 @@ def _validate_provider_capabilities(
                     f"agent(s): {sorted(agent_names)!r}. Override these agents "
                     f"to a timeout-aware provider, or remove the workflow-level "
                     f"max_session_seconds."
+                )
+
+    # ----- Workflow-level: idle_recovery tuning knobs -----
+    # runtime.idle_timeout_seconds / runtime.max_idle_recovery_attempts are
+    # Copilot-only tuning knobs (#488). Unlike max_session_seconds, these are
+    # not safety bounds — a provider that ignores them just runs its own
+    # idle-detection defaults (or none at all) rather than violating an
+    # operational guarantee — so a mismatch is a warning, not an error.
+    if runtime_idle_timeout_seconds is not None or runtime_max_idle_recovery_attempts is not None:
+        providers_using_idle_recovery: dict[str, list[str]] = {}
+        for agent in all_llm_agents:
+            pname = _resolved_provider_name(agent, default_provider)
+            providers_using_idle_recovery.setdefault(pname, []).append(agent.name)
+        for pname, agent_names in providers_using_idle_recovery.items():
+            pcaps = _caps_for(pname)
+            if pcaps is not None and not pcaps.idle_recovery:
+                set_fields = [
+                    name
+                    for name, value in (
+                        ("idle_timeout_seconds", runtime_idle_timeout_seconds),
+                        ("max_idle_recovery_attempts", runtime_max_idle_recovery_attempts),
+                    )
+                    if value is not None
+                ]
+                warnings.append(
+                    f"Workflow declares 'runtime.{'/'.join(set_fields)}' but provider "
+                    f"'{pname}' does not support idle-recovery tuning "
+                    f"(capabilities.idle_recovery=False) and is used by agent(s): "
+                    f"{sorted(agent_names)!r}. The setting will be silently ignored "
+                    f"for these agents."
                 )
 
     # ----- Workflow-level: working_dir -----

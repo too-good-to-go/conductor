@@ -8,6 +8,7 @@ flag/exit-code cases; one test runs the real offline path end-to-end.
 from __future__ import annotations
 
 import importlib
+import io
 import json
 from unittest.mock import AsyncMock
 
@@ -22,6 +23,11 @@ from conductor.providers.diagnostics import (
     CredentialEnvVar,
     DoctorReport,
     EnvDiagnostic,
+    McpServeCollision,
+    McpServeDiagnostic,
+    McpServeFailedRegistry,
+    McpServeRejectedWorkflow,
+    McpServeToolInfo,
     ModelDiagnostic,
     ProviderDiagnostic,
     RegistryDiagnostic,
@@ -69,6 +75,7 @@ def _prov(
     checked: bool = False,
     connection_ok: bool | None = None,
     connection_error: str | None = None,
+    connection_note: str | None = None,
     models: list[str] | list[ModelDiagnostic] | None = None,
     models_error: str | None = None,
     note: str | None = None,
@@ -96,6 +103,7 @@ def _prov(
         checked=checked,
         connection_ok=connection_ok,
         connection_error=connection_error,
+        connection_note=connection_note,
         models=model_diagnostics,
         models_error=models_error,
         note=note,
@@ -793,6 +801,391 @@ class TestDoctorModelsPricing:
 
 
 # ---------------------------------------------------------------------------
+# MCP serve section (issue #432, E13)
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorMcpServeRendering:
+    """Mocked-gather rendering tests for the ``mcp`` section."""
+
+    def test_mcp_is_a_valid_section(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+        _patch_gather(
+            monkeypatch,
+            DoctorReport(mcp_serve=McpServeDiagnostic()),
+            captured,
+        )
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert captured["sections"] == ("mcp",)
+
+    def test_mcp_included_in_default_sections(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict[str, object] = {}
+        _patch_gather(monkeypatch, DoctorReport(mcp_serve=McpServeDiagnostic()), captured)
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0
+        assert "mcp" in captured["sections"]
+
+    def test_no_registries_renders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(mcp_serve=McpServeDiagnostic(registries=[], tools=[], mode="direct"))
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "no tools" in result.output
+
+    def test_registries_configured_but_no_tools_exposed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        report = DoctorReport(
+            mcp_serve=McpServeDiagnostic(registries=["official"], tools=[], mode="direct")
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "No workflows would be exposed" in result.output
+
+    def test_one_registry_with_a_tool_renders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            mcp_serve=McpServeDiagnostic(
+                registries=["official"],
+                tools=[
+                    McpServeToolInfo(
+                        tool_name="review_pr",
+                        registry="official",
+                        workflow="review-pr",
+                        resolution_tier="parsed",
+                        pin="hash:" + "a" * 64,
+                    )
+                ],
+                mode="direct",
+            )
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "review_pr" in result.output
+        assert "official" in result.output
+        assert "review-pr" in result.output
+        assert "direct" in result.output
+
+    def test_degraded_schema_is_flagged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            mcp_serve=McpServeDiagnostic(
+                registries=["official"],
+                tools=[
+                    McpServeToolInfo(
+                        tool_name="broken_wf",
+                        registry="official",
+                        workflow="broken-wf",
+                        resolution_tier="degraded",
+                        pin="hash:" + "b" * 64,
+                    )
+                ],
+                mode="direct",
+                degraded=["broken_wf"],
+            )
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "degraded" in result.output
+
+    def test_collision_renders_qualified_names(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            mcp_serve=McpServeDiagnostic(
+                registries=["official", "team"],
+                tools=[
+                    McpServeToolInfo(
+                        tool_name="official_review_pr",
+                        registry="official",
+                        workflow="review-pr",
+                        resolution_tier="parsed",
+                        pin="hash:" + "a" * 64,
+                    ),
+                    McpServeToolInfo(
+                        tool_name="team_review_pr",
+                        registry="team",
+                        workflow="review-pr",
+                        resolution_tier="parsed",
+                        pin="hash:" + "b" * 64,
+                    ),
+                ],
+                mode="direct",
+                collisions=[
+                    McpServeCollision(
+                        base_slug="review_pr",
+                        identities=["official/review-pr", "team/review-pr"],
+                        qualified_names=["official_review_pr", "team_review_pr"],
+                    )
+                ],
+            )
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "official_review_pr" in result.output
+        assert "team_review_pr" in result.output
+        assert "collision" in result.output
+
+    def test_rejected_workflow_renders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            mcp_serve=McpServeDiagnostic(
+                registries=["official"],
+                tools=[],
+                mode="direct",
+                rejected=[
+                    McpServeRejectedWorkflow(
+                        registry="official",
+                        workflow="bad-wf",
+                        reason="input '_wait_seconds' collides with the reserved parameter",
+                    )
+                ],
+            )
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "bad-wf" in result.output
+        assert "reserved parameter" in result.output
+
+    def test_failed_registry_renders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            mcp_serve=McpServeDiagnostic(
+                registries=["broken"],
+                tools=[],
+                mode="direct",
+                failed_registries=[
+                    McpServeFailedRegistry(
+                        registry="broken",
+                        reason="could not resolve its index",
+                    )
+                ],
+            )
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "broken" in result.output
+        assert "could not resolve its index" in result.output
+
+    def test_broken_registry_degrades_to_reported_problem(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A total catastrophic failure (e.g. malformed registries.toml) is
+        # surfaced via `error`, never a crash -- mirrors the registries
+        # section's own error handling.
+        report = DoctorReport(mcp_serve=McpServeDiagnostic(error="malformed registries.toml"))
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "failed to build the MCP catalogue" in result.output
+        assert "malformed registries.toml" in result.output
+
+    def test_json_includes_mcp_serve(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            mcp_serve=McpServeDiagnostic(
+                registries=["official"],
+                tools=[
+                    McpServeToolInfo(
+                        tool_name="review_pr",
+                        registry="official",
+                        workflow="review-pr",
+                        resolution_tier="parsed",
+                        pin="hash:" + "a" * 64,
+                    )
+                ],
+                mode="direct",
+                failed_registries=[McpServeFailedRegistry(registry="broken", reason="unreachable")],
+            )
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "mcp", "--json"])
+        assert result.exit_code == 0
+        data = json.loads(result.stdout)
+        assert data["mcp_serve"]["mode"] == "direct"
+        assert data["mcp_serve"]["registries"] == ["official"]
+        assert data["mcp_serve"]["tools"][0]["tool_name"] == "review_pr"
+        assert data["mcp_serve"]["tools"][0]["pin"] == "hash:" + "a" * 64
+        assert data["mcp_serve"]["failed_registries"] == [
+            {"registry": "broken", "reason": "unreachable"}
+        ]
+
+
+def _toml_str(value: str) -> str:
+    """Render *value* as a TOML **literal** string (single-quoted).
+
+    A filesystem path interpolated into a TOML *basic* string is parsed for
+    escape sequences, so a Windows path fails to parse: ``C:\\Users\\...``
+    opens an invalid ``\\U`` unicode escape, and ``\\AppData``/``\\Temp`` are
+    unknown escapes. Literal strings perform no escape processing at all,
+    which is TOML's own answer for paths. Only ``registries.toml`` fixtures
+    carrying a real ``tmp_path`` need this — a hardcoded ``owner/repo``
+    source has no backslashes and is unaffected.
+    """
+    return f"'{value}'"
+
+
+class TestGatherMcpServe:
+    """Real (unpatched) ``gather_mcp_serve`` / ``conductor doctor mcp`` tests,
+    exercising the actual catalogue-building pipeline against on-disk
+    registry fixtures (issue #432, E13-T3)."""
+
+    def test_no_registries_configured_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    ) -> None:
+        monkeypatch.setenv("CONDUCTOR_HOME", str(tmp_path))
+        from conductor.providers.diagnostics import gather_mcp_serve
+
+        diag = gather_mcp_serve()
+        assert diag.error is None
+        assert diag.registries == []
+        assert diag.tools == []
+        assert diag.mode == "direct"
+
+    def test_one_registry_with_a_workflow_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    ) -> None:
+        from tests.test_mcp.conftest import write_path_registry
+
+        home = tmp_path / "home"  # type: ignore[operator]
+        home.mkdir()
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+
+        entry = write_path_registry(
+            tmp_path,  # type: ignore[arg-type]
+            name="official",
+            workflows={"review-pr": _SIMPLE_WORKFLOW_YAML.format(name="review-pr")},
+        )
+        (home / "registries.toml").write_text(
+            f'[registries.official]\ntype = "path"\nsource = {_toml_str(entry.source)}\n',
+            encoding="utf-8",
+        )
+
+        from conductor.providers.diagnostics import gather_mcp_serve
+
+        diag = gather_mcp_serve()
+        assert diag.error is None
+        assert diag.registries == ["official"]
+        assert len(diag.tools) == 1
+        assert diag.tools[0].registry == "official"
+        assert diag.tools[0].workflow == "review-pr"
+        assert diag.mode == "direct"
+
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "official" in result.output
+
+    def test_collision_across_two_registries_end_to_end(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    ) -> None:
+        from tests.test_mcp.conftest import write_path_registry
+
+        home = tmp_path / "home"  # type: ignore[operator]
+        home.mkdir()
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+
+        official = write_path_registry(
+            tmp_path,  # type: ignore[arg-type]
+            name="official",
+            workflows={"review-pr": _SIMPLE_WORKFLOW_YAML.format(name="review-pr")},
+        )
+        team = write_path_registry(
+            tmp_path,  # type: ignore[arg-type]
+            name="team",
+            workflows={"review-pr": _SIMPLE_WORKFLOW_YAML.format(name="review-pr")},
+        )
+        (home / "registries.toml").write_text(
+            "[registries.official]\n"
+            'type = "path"\n'
+            f"source = {_toml_str(official.source)}\n"
+            "[registries.team]\n"
+            'type = "path"\n'
+            f"source = {_toml_str(team.source)}\n",
+            encoding="utf-8",
+        )
+
+        from conductor.providers.diagnostics import gather_mcp_serve
+
+        diag = gather_mcp_serve()
+        assert diag.error is None
+        assert {t.tool_name for t in diag.tools} == {"official_review_pr", "team_review_pr"}
+        assert len(diag.collisions) == 1
+        assert diag.collisions[0].base_slug == "review_pr"
+
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exit_code == 0
+        assert "official_review_pr" in result.output
+        assert "team_review_pr" in result.output
+
+    def test_unreachable_github_registry_degrades_without_raising(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    ) -> None:
+        # A github registry with no warm cache (no ref pointer ever
+        # recorded) cannot be resolved offline -- the catalogue builder
+        # skips it (logged, not raised); the diagnostic reports the empty
+        # result rather than surfacing an exception.
+        home = tmp_path / "home"  # type: ignore[operator]
+        home.mkdir()
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+        (home / "registries.toml").write_text(
+            '[registries.broken]\ntype = "github"\nsource = "someorg/does-not-exist"\n',
+            encoding="utf-8",
+        )
+
+        from conductor.providers.diagnostics import gather_mcp_serve
+
+        diag = gather_mcp_serve()
+        assert diag.error is None
+        assert diag.registries == ["broken"]
+        assert diag.tools == []
+        assert diag.mode == "direct"
+        assert len(diag.failed_registries) == 1
+        assert diag.failed_registries[0].registry == "broken"
+        assert diag.failed_registries[0].reason
+
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "broken" in result.output
+
+    def test_malformed_registries_toml_degrades_to_reported_error(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: object
+    ) -> None:
+        home = tmp_path / "home"  # type: ignore[operator]
+        home.mkdir()
+        monkeypatch.setenv("CONDUCTOR_HOME", str(home))
+        (home / "registries.toml").write_text("this is not valid toml [[[", encoding="utf-8")
+
+        from conductor.providers.diagnostics import gather_mcp_serve
+
+        diag = gather_mcp_serve()
+        assert diag.error is not None
+        assert diag.tools == []
+
+        result = runner.invoke(app, ["doctor", "mcp"])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "failed to build the MCP catalogue" in result.output
+
+
+_SIMPLE_WORKFLOW_YAML = """\
+workflow:
+  name: {name}
+  description: A simple workflow named {name}.
+  entry_point: worker
+agents:
+  - name: worker
+    prompt: "Do the thing."
+    output:
+      result:
+        type: string
+output:
+  result: "{{{{ worker.output.result }}}}"
+"""
+
+
+# ---------------------------------------------------------------------------
 # Error handling
 # ---------------------------------------------------------------------------
 
@@ -859,3 +1252,148 @@ class TestDoctorMarkupSafety:
         assert "failed to load registries" in result.output
         assert "line 3" in result.output
         assert "No registries configured" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# Encoding fallback (issue #401)
+# ---------------------------------------------------------------------------
+
+
+class TestDoctorEncodingFallback:
+    """The table output degrades to ASCII glyphs on a stream that cannot
+    encode the Unicode ones, instead of dying part-written."""
+
+    def _bind_console(
+        self, monkeypatch: pytest.MonkeyPatch, encoding: str
+    ) -> tuple[io.BytesIO, io.TextIOWrapper]:
+        """Point the CLI's output console at a fresh buffer with *encoding*.
+
+        Returns the raw byte buffer rather than relying on ``result.output``:
+        Click's ``CliRunner`` captures through a UTF-8 stream that would
+        accept a glyph a real cp1252 console rejects, so a test could pass
+        on output the user never gets. Binding the CLI's console to a
+        ``TextIOWrapper`` in the target *encoding* makes a leaked glyph
+        raise ``UnicodeEncodeError`` at write time, surfacing via
+        ``result.exception``.
+        """
+        buffer = io.BytesIO()
+        stream = io.TextIOWrapper(buffer, encoding=encoding, newline="")
+        monkeypatch.setattr(_app_module, "output_console", make_console(file=stream, width=200))
+        monkeypatch.setattr(
+            _app_module, "console", make_console(file=stream, stderr=True, width=200)
+        )
+        return buffer, stream
+
+    @pytest.mark.parametrize(
+        "shape_kwargs",
+        [
+            pytest.param({}, id="no-connection-data"),
+            pytest.param(
+                {
+                    "checked": True,
+                    "connection_ok": True,
+                    "connection_note": "probe was inconclusive; endpoint may lack /v1/models",
+                },
+                id="connection-note",
+            ),
+        ],
+    )
+    @pytest.mark.parametrize("cli_args", [[], ["--check"], ["--models"]])
+    def test_cp1252_console_renders_ascii_glyphs_without_crashing(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        shape_kwargs: dict[str, object],
+        cli_args: list[str],
+    ) -> None:
+        # The "connection-note" shape crossed with "--check"/"--models" is
+        # what exercises _connection_cell's warning branch: the two flags
+        # that add the Connection column are the only paths that ever touch
+        # the cp1252 stream with this data (#401 follow-up review).
+        buffer, stream = self._bind_console(monkeypatch, "cp1252")
+        report = DoctorReport(
+            providers=[_prov("copilot", installed=True, **shape_kwargs)],
+            registries=RegistryDiagnostic(
+                default="local",
+                registries=[
+                    RegistryInfo(name="local", type="path", source="~/.conductor", is_default=True)
+                ],
+            ),
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", *cli_args])
+        stream.flush()
+        assert result.exception is None
+        assert result.exit_code == 0
+        # Decode is exact, not lossy; a leaked glyph is caught by the
+        # result.exception assertion above, which fails at write time.
+        output = buffer.getvalue().decode("cp1252")
+        assert "OK" in output
+
+    def test_utf8_console_keeps_unicode_glyphs(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        buffer, stream = self._bind_console(monkeypatch, "utf-8")
+        report = DoctorReport(providers=[_prov("copilot", installed=True)])
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor"])
+        stream.flush()
+        assert result.exception is None
+        assert result.exit_code == 0
+        output = buffer.getvalue().decode("utf-8")
+        assert "✓" in output
+        assert "OK" not in output
+
+    def test_stream_with_no_encoding_keeps_unicode_glyphs(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A console file with no encoding (``.encoding is None``, e.g. an
+        in-memory ``StringIO``) is treated as capable of anything, not
+        downgraded to ASCII (#401)."""
+        stream = io.StringIO()
+        assert stream.encoding is None
+        monkeypatch.setattr(_app_module, "output_console", make_console(file=stream, width=200))
+        monkeypatch.setattr(
+            _app_module, "console", make_console(file=stream, stderr=True, width=200)
+        )
+        report = DoctorReport(providers=[_prov("copilot", installed=True)])
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor"])
+        assert result.exception is None
+        assert result.exit_code == 0
+        assert "✓" in stream.getvalue()
+        assert "OK" not in stream.getvalue()
+
+
+class TestDoctorTierAndModelsErrorCells:
+    """Two more per-cell branches driven by the same glyph set as the
+    encoding-fallback tests above, exercised on the default UTF-8 path."""
+
+    def test_missing_tier_renders_dash(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Credentials and note are filled so the tier cell is the only one
+        # that can render a dash; with _prov's defaults both of those cells
+        # dash too, and the assertion holds even without the tier=None
+        # branch under test (caught by review on #469).
+        report = DoctorReport(
+            providers=[
+                _prov(
+                    "copilot",
+                    tier=None,
+                    creds=[CredentialEnvVar(name="COPILOT_TOKEN", present=True)],
+                    note="see docs",
+                )
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0
+        assert "—" in result.output
+
+    def test_models_error_renders_cross_with_message(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        report = DoctorReport(
+            providers=[
+                _prov("copilot", checked=True, connection_ok=True, models_error="rate limited")
+            ]
+        )
+        _patch_gather(monkeypatch, report)
+        result = runner.invoke(app, ["doctor", "--models"])
+        assert result.exit_code == 0
+        assert "rate limited" in result.output
+        assert "✗" in result.output

@@ -21,6 +21,9 @@ import type {
   WaitFailedData,
   SetCompletedData,
   SetFailedData,
+  McpStartedData,
+  McpCompletedData,
+  McpFailedData,
   GatePresentedData,
   GateResolvedData,
   GateOptionDetail,
@@ -95,6 +98,12 @@ export interface ForEachItemData {
   prompt?: string;
   output?: unknown;
   activity: ActivityEntry[];
+  mcp_server?: string;
+  mcp_tool?: string;
+  mcp_is_error?: boolean;
+  mcp_result_bytes?: number;
+  mcp_truncated?: boolean;
+  mcp_spill_path?: string;
 }
 
 export interface NodeData {
@@ -120,6 +129,15 @@ export interface NodeData {
   iteration?: number;
   error_type?: string;
   error_message?: string;
+
+  // MCP-specific
+  mcp_server?: string;
+  mcp_tool?: string;
+  mcp_is_error?: boolean;
+  mcp_result_bytes?: number;
+  mcp_truncated?: boolean;
+  mcp_spill_path?: string;
+
   // Script-specific
   stdout?: string;
   stderr?: string;
@@ -283,7 +301,7 @@ export interface HighlightedEdge {
 
 export type LogLevel = 'info' | 'success' | 'error' | 'warning' | 'debug';
 
-export type ActivityLogType = 'reasoning' | 'tool-start' | 'tool-complete' | 'turn' | 'message' | 'prompt' | 'parse-recovery';
+export type ActivityLogType = 'reasoning' | 'tool-start' | 'tool-complete' | 'turn' | 'message' | 'prompt' | 'parse-recovery' | 'compaction-config' | 'compaction-start' | 'compaction-complete' | 'compaction-error';
 
 export interface LogEntry {
   timestamp: number;
@@ -605,12 +623,13 @@ function buildStaticChildContext(
 
   const groupAgents = new Set<string>();
   const agentNames = new Set<string>();
+  const agentTypes = new Map<string, NodeType>(ctx.agents.map((a) => [a.name, (a.type || 'agent') as NodeType]));
   for (const pg of ctx.parallelGroups) {
     for (const a of pg.agents) groupAgents.add(a);
     agentNames.add(pg.name);
     ensureNode(ctx.nodes, pg.name, 'parallel_group');
     ctx.groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
-    for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, 'agent');
+    for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, agentTypes.get(agentName) || 'agent');
   }
   for (const fg of ctx.forEachGroups) {
     agentNames.add(fg.name);
@@ -1465,13 +1484,14 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
       const groupAgents = new Set<string>();
       const agentNames = new Set<string>();
+      const agentTypes = new Map<string, NodeType>(state.agents.map((a) => [a.name, (a.type || 'agent') as NodeType]));
 
       for (const pg of state.parallelGroups) {
         for (const a of pg.agents) groupAgents.add(a);
         agentNames.add(pg.name);
         ensureNode(state.nodes, pg.name, 'parallel_group');
         state.groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
-        for (const agentName of pg.agents) ensureNode(state.nodes, agentName, 'agent');
+        for (const agentName of pg.agents) ensureNode(state.nodes, agentName, agentTypes.get(agentName) || 'agent');
       }
       for (const fg of state.forEachGroups) {
         agentNames.add(fg.name);
@@ -1528,13 +1548,14 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
 
         const groupAgents = new Set<string>();
         const agentNames = new Set<string>();
+        const agentTypes = new Map<string, NodeType>(ctx.agents.map((a) => [a.name, (a.type || 'agent') as NodeType]));
 
         for (const pg of ctx.parallelGroups) {
           for (const a of pg.agents) groupAgents.add(a);
           agentNames.add(pg.name);
           ensureNode(ctx.nodes, pg.name, 'parallel_group');
           ctx.groupProgress[pg.name] = { total: pg.agents.length, completed: 0, failed: 0 };
-          for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, 'agent');
+          for (const agentName of pg.agents) ensureNode(ctx.nodes, agentName, agentTypes.get(agentName) || 'agent');
         }
         for (const fg of ctx.forEachGroups) {
           agentNames.add(fg.name);
@@ -1558,6 +1579,18 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
           }
         }
         ctx.agentsTotal = agentNames.size;
+
+        // The incoming runtime topology is authoritative over a reused
+        // static-preview placeholder (see buildStaticChildContext /
+        // placeChildContext): ensureNode never updates an existing node's
+        // type, so a placeholder member seeded before the declared type was
+        // honoured would keep rendering as a generic agent. Sync every
+        // declared agent's node type explicitly — walking ctx.agents leaves
+        // the group nodes (parallel_group / for_each_group) untouched.
+        for (const a of ctx.agents) {
+          const nd = ctx.nodes[a.name];
+          if (nd) nd.type = (a.type || 'agent') as NodeType;
+        }
 
         // Eagerly seed static sub-workflow previews for this child's own
         // `type: workflow` steps (see `buildStaticChildContext`).
@@ -1674,7 +1707,12 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
     const t = activeTarget(state, _data);
     const nd = ensureNode(t.nodes, data.agent_name);
-    nd.prompt = data.rendered_prompt;
+    // A continuation retry sends only the new follow-up turn — the original
+    // task prompt lives in the provider-held conversation — so the panel
+    // keeps the existing prompt and appends the turn instead of replacing it.
+    nd.prompt = data.continuation
+      ? `${nd.prompt ?? ''}\n\n${data.rendered_prompt}`
+      : data.rendered_prompt;
     nd.context_keys = data.context_keys;
     if (itemKey) {
       addForEachItemActivity(t.nodes, data.agent_name, itemKey, {
@@ -1684,7 +1722,11 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
       const itemNd = t.nodes[data.agent_name];
       if (itemNd?.for_each_items) {
         const item = itemNd.for_each_items.find((i) => i.key === itemKey);
-        if (item) item.prompt = data.rendered_prompt;
+        if (item) {
+          item.prompt = data.continuation
+            ? `${item.prompt ?? ''}\n\n${data.rendered_prompt}`
+            : data.rendered_prompt;
+        }
       }
     }
     replaceNode(t.nodes, data.agent_name);
@@ -1715,6 +1757,49 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
     const t = activeTarget(state, _data);
     const entry: ActivityEntry = { type: 'tool-complete', icon: '✓', label: 'result', text: data.tool_name || 'done', detail: data.result || null };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  agent_compaction_config: (state, _data) => {
+    const data = _data as unknown as import('@/types/events').AgentCompactionConfigData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const entry: ActivityEntry = data.enabled === false
+      ? { type: 'compaction-config', icon: '⚙', label: 'compaction', text: `disabled${data.disabled_reason ? `: ${data.disabled_reason}` : ''}` }
+      : { type: 'compaction-config', icon: '⚙', label: 'compaction', text: `armed (window ${data.context_window} from ${data.context_window_source}, output limit ${data.output_limit} from ${data.output_limit_source}, trigger ${data.trigger_tokens ?? '?'}, target ${data.target_tokens ?? '?'})` };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  agent_compaction_start: (state, _data) => {
+    const data = _data as unknown as import('@/types/events').AgentCompactionStartData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    const entry: ActivityEntry = { type: 'compaction-start', icon: '🧹', label: 'compacting', text: `compacting context (${data.tokens_before ?? '?'} tokens, window ${data.context_window} from ${data.context_window_source})` };
+    addActivity(t.nodes, data.agent_name, entry);
+    if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
+    replaceNode(t.nodes, data.agent_name);
+  },
+
+  agent_compaction_complete: (state, _data) => {
+    const data = _data as unknown as import('@/types/events').AgentCompactionCompleteData;
+    const itemKey = (_data as Record<string, unknown>).item_key as string | undefined;
+    const t = activeTarget(state, _data);
+    let entry: ActivityEntry;
+    if (data.errored) {
+      entry = { type: 'compaction-error', icon: '⚠️', label: 'compaction failed', text: `${data.error_type || 'Error'}: ${data.message || 'unknown'}` };
+    } else if (data.still_over_trigger || (data.degraded_tiers && data.degraded_tiers.length > 0)) {
+      const reasons = [
+        ...(data.degraded_tiers && data.degraded_tiers.length > 0 ? [`degraded tiers: ${data.degraded_tiers.join(', ')}`] : []),
+        ...(data.still_over_trigger ? ['still over trigger'] : []),
+      ];
+      entry = { type: 'compaction-error', icon: '⚠️', label: 'compacted with warnings', text: `${data.tokens_before ?? '?'} → ${data.tokens_after ?? '?'} tokens (${reasons.join('; ')})` };
+    } else {
+      entry = { type: 'compaction-complete', icon: '🧹', label: 'compacted', text: `${data.tokens_before ?? '?'} → ${data.tokens_after ?? '?'} tokens (${data.messages_before ?? '?'} → ${data.messages_after ?? '?'} messages, ${data.elapsed != null ? formatSec(data.elapsed) : '?'}${data.tokens_saved != null ? `, saved ${data.tokens_saved} tokens` : ''})` };
+    }
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey) addForEachItemActivity(t.nodes, data.agent_name, itemKey, entry);
     replaceNode(t.nodes, data.agent_name);
@@ -1860,6 +1945,101 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
     nd.error_type = data.error_type;
     nd.error_message = data.message;
     replaceNode(t.nodes, data.agent_name);
+  },
+
+  mcp_started: (state, _data, timestamp) => {
+    const data = _data as unknown as McpStartedData;
+    const t = activeTarget(state, _data);
+
+    if (data.group_name != null && data.item_key != null) {
+      const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
+      if (nd.for_each_items) {
+        nd.for_each_items = nd.for_each_items.map((i) =>
+          i.key === data.item_key ? { ...i, status: 'running' } : i
+        );
+      }
+      replaceNode(t.nodes, data.group_name);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name, 'mcp');
+      nd.status = 'running';
+      nd.startedAt = timestamp ?? Date.now() / 1000;
+      replaceNode(t.nodes, data.agent_name);
+    }
+  },
+
+  mcp_completed: (state, _data) => {
+    const data = _data as unknown as McpCompletedData;
+    const t = activeTarget(state, _data);
+
+    if (data.group_name != null && data.item_key != null) {
+      const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
+      if (nd.for_each_items) {
+        nd.for_each_items = nd.for_each_items.map((i) =>
+          i.key === data.item_key
+            ? {
+                ...i,
+                status: 'completed',
+                elapsed: data.elapsed,
+                mcp_server: data.server,
+                mcp_tool: data.tool,
+                mcp_is_error: data.is_error,
+                mcp_result_bytes: data.result_bytes,
+                mcp_truncated: data.truncated,
+                mcp_spill_path: data.spill_path,
+              }
+            : i
+        );
+      }
+      replaceNode(t.nodes, data.group_name);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name, 'mcp');
+      nd.status = 'completed';
+      if (data.group_name == null) {
+        t.incrCompleted();
+      }
+      nd.elapsed = data.elapsed;
+      nd.mcp_server = data.server;
+      nd.mcp_tool = data.tool;
+      nd.mcp_is_error = data.is_error;
+      nd.mcp_result_bytes = data.result_bytes;
+      nd.mcp_truncated = data.truncated;
+      nd.mcp_spill_path = data.spill_path;
+      replaceNode(t.nodes, data.agent_name);
+    }
+  },
+
+  mcp_failed: (state, _data) => {
+    const data = _data as unknown as McpFailedData;
+    const t = activeTarget(state, _data);
+
+    if (data.group_name != null && data.item_key != null) {
+      const nd = ensureNode(t.nodes, data.group_name, 'for_each_group');
+      if (nd.for_each_items) {
+        nd.for_each_items = nd.for_each_items.map((i) =>
+          i.key === data.item_key
+            ? {
+                ...i,
+                status: 'failed',
+                elapsed: data.elapsed,
+                mcp_server: data.server,
+                mcp_tool: data.tool,
+                error_type: data.error_type,
+                error_message: data.message,
+              }
+            : i
+        );
+      }
+      replaceNode(t.nodes, data.group_name);
+    } else {
+      const nd = ensureNode(t.nodes, data.agent_name, 'mcp');
+      nd.status = 'failed';
+      nd.elapsed = data.elapsed;
+      nd.mcp_server = data.server;
+      nd.mcp_tool = data.tool;
+      nd.error_type = data.error_type;
+      nd.error_message = data.message;
+      replaceNode(t.nodes, data.agent_name);
+    }
   },
 
   gate_presented: (state, _data) => {
@@ -2590,7 +2770,10 @@ const eventHandlers: Record<string, (state: MutableState, data: Record<string, u
         : data.will_retry
           ? 're-running once with feedback'
           : 'validation failed (no retry)',
-      detail: data.issues && data.issues.length ? data.issues.join('\n') : null,
+      detail: [
+        ...(data.issues && data.issues.length ? [data.issues.join('\n')] : []),
+        ...(rerunErrored && data.error ? [`cause: ${data.error}`] : []),
+      ].join('\n') || null,
     };
     addActivity(t.nodes, data.agent_name, entry);
     if (itemKey != null) {
@@ -2642,6 +2825,15 @@ function buildLogEntry(event: WorkflowEvent): LogEntry | null {
 
     case 'script_failed':
       return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `Script failed: ${d.message || d.error_type || 'unknown error'}` };
+
+    case 'mcp_started':
+      return { timestamp: ts, level: 'info', source: String(d.agent_name), message: `MCP tool started: ${(d.server as string)}/${(d.tool as string)}` };
+
+    case 'mcp_completed':
+      return { timestamp: ts, level: d.is_error ? 'warning' : 'success', source: String(d.agent_name), message: `MCP tool completed: ${(d.server as string)}/${(d.tool as string)}${d.elapsed != null ? ` in ${formatSec(d.elapsed as number)}` : ''}` };
+
+    case 'mcp_failed':
+      return { timestamp: ts, level: 'error', source: String(d.agent_name), message: `MCP tool failed: ${(d.server as string)}/${(d.tool as string)} — ${d.message || d.error_type || 'unknown error'}` };
 
     case 'wait_started': {
       const dur = d.duration_seconds as number | null | undefined;
@@ -2873,6 +3065,46 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
         detail: d.result ? truncate(String(d.result), 300) : null,
       };
 
+    case 'agent_compaction_config':
+      if (d.enabled === false) {
+        return {
+          timestamp: ts, source: String(d.agent_name), type: 'compaction-config',
+          message: `⚙ compaction disabled${d.disabled_reason ? `: ${d.disabled_reason}` : ''}`,
+        };
+      }
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'compaction-config',
+        message: `⚙ compaction armed (window ${d.context_window} from ${d.context_window_source}, output limit ${d.output_limit} from ${d.output_limit_source}, trigger ${d.trigger_tokens ?? '?'}, target ${d.target_tokens ?? '?'})`,
+      };
+
+    case 'agent_compaction_start':
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'compaction-start',
+        message: `🧹 compacting context (${d.tokens_before ?? '?'} tokens, window ${d.context_window} from ${d.context_window_source})`,
+      };
+
+    case 'agent_compaction_complete':
+      if (d.errored) {
+        return {
+          timestamp: ts, source: String(d.agent_name), type: 'compaction-error',
+          message: `⚠️ compaction failed — ${d.error_type || 'Error'}: ${d.message || 'unknown'}`,
+        };
+      }
+      if (d.still_over_trigger || (Array.isArray(d.degraded_tiers) && d.degraded_tiers.length > 0)) {
+        const reasons = [
+          ...(Array.isArray(d.degraded_tiers) && d.degraded_tiers.length > 0 ? [`degraded tiers: ${(d.degraded_tiers as string[]).join(', ')}`] : []),
+          ...(d.still_over_trigger ? ['still over trigger'] : []),
+        ];
+        return {
+          timestamp: ts, source: String(d.agent_name), type: 'compaction-error',
+          message: `⚠️ context compacted with warnings: ${d.tokens_before ?? '?'} → ${d.tokens_after ?? '?'} tokens (${reasons.join('; ')})`,
+        };
+      }
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'compaction-complete',
+        message: `🧹 context compacted: ${d.tokens_before ?? '?'} → ${d.tokens_after ?? '?'} tokens (${d.messages_before ?? '?'} → ${d.messages_after ?? '?'} messages, ${d.elapsed != null ? formatSec(d.elapsed as number) : '?'}${typeof d.tokens_saved === 'number' ? `, saved ${d.tokens_saved} tokens` : ''})`,
+      };
+
     case 'agent_tool_output_truncated':
       return {
         timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
@@ -2914,6 +3146,19 @@ function buildActivityLogEntry(event: WorkflowEvent): ActivityLogEntry | null {
 
     case 'script_failed':
       return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `Script failed: ${d.message || d.error_type || 'unknown'}` };
+
+    case 'mcp_started':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `MCP tool started: ${(d.server as string)}/${(d.tool as string)}` };
+
+    case 'mcp_completed':
+      return {
+        timestamp: ts, source: String(d.agent_name), type: 'tool-complete',
+        message: `MCP tool completed: ${(d.server as string)}/${(d.tool as string)}${d.is_error ? ' (error)' : ''}`,
+        detail: d.result_bytes ? `${d.result_bytes} bytes${d.truncated ? ' (truncated)' : ''}` : null,
+      };
+
+    case 'mcp_failed':
+      return { timestamp: ts, source: String(d.agent_name), type: 'turn', message: `MCP tool failed: ${(d.server as string)}/${(d.tool as string)} — ${d.message || d.error_type || 'unknown'}` };
 
     case 'wait_started': {
       const dur = d.duration_seconds as number | null | undefined;

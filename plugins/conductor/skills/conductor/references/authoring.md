@@ -48,10 +48,6 @@ workflow:
         input_per_mtok: 3.0
         output_per_mtok: 15.0
 
-  hooks:                         # Optional lifecycle expressions
-    on_start: "..."              # Evaluated when workflow starts
-    on_complete: "..."           # Evaluated on success
-    on_error: "..."              # Evaluated on failure
 
   metadata:                      # Optional arbitrary key-values surfaced in workflow_started events
     tracker: ado
@@ -99,7 +95,7 @@ event + console warning. See
 ```yaml
 agents:
   - name: my_agent               # Required: unique identifier
-    type: agent                  # agent (default), human_gate, script, workflow, wait, or terminate
+    type: agent                  # agent (default), human_gate, script, workflow, wait, terminate, or mcp
     description: What it does
     model: gpt-5.2               # Override workflow default
     provider: claude             # Optional: per-agent provider override
@@ -573,6 +569,68 @@ Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prom
 
 `output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`). A single-`value:` step with a declared schema that produces a scalar raises a `ValidationError` pointing to `values:`.
 
+## MCP Steps (`type: mcp`)
+
+Directly invoke tools on configured MCP servers (`workflow.runtime.mcp_servers`) without an LLM. MCP steps run deterministically, spend zero prompt tokens, and capture structured output into the workflow context.
+
+```yaml
+agents:
+  - name: read_spec
+    type: mcp
+    server: filesystem                      # Required: literal server name in runtime.mcp_servers
+    tool: read_file                         # Required: literal tool name on the server
+    arguments:                              # Optional: dict of Jinja2-templated arguments
+      path: "docs/spec.md"
+    timeout: 30                             # Optional: per-call timeout in seconds
+    routes:
+      - to: handle_error
+        when: "{{ output.is_error }}"
+      - to: analyze_spec
+```
+
+### Argument Rendering and Type Coercion
+
+Dict and list structures in `arguments:` are traversed recursively. String leaves are Jinja2-rendered against workflow context, and each **fully rendered string** is then YAML-parsed (the `set` step's `auto` rule) — whatever the rendered text parses as becomes the argument value: `"105"` -> `105`, `"true"` -> `True`, `"null"` -> `None`, and also collections (`"[1, 2]"` -> a list, `"a: 1"` -> a mapping). This applies to templates too: `"1{{ x }}"` with `x=2` renders `"12"` and becomes the integer `12`; only renders whose text parses as a plain string (e.g. `"pre-{{ x }}"` -> `"pre-2"`, multi-word prose) stay strings. YAML-native scalars (integers, floats, booleans, `None`) pass through untouched. Quote and type-check values where the exact type matters.
+
+### Output Envelope and Merging
+
+MCP steps produce an output envelope:
+
+```json
+{
+  "content": [
+    {"type": "text", "text": "..."}
+  ],
+  "structured": {"record_id": 42, "status": "ok"},
+  "is_error": false
+}
+```
+
+When `structured` is a dictionary, its top-level keys are merged onto the step output dict. Reserved keys are never overridden by the merge: the envelope's own `content`, `structured`, `is_error`, plus `outputs` and `errors` (the workflow engine duck-types parallel/for-each group outputs by those two keys — a structured result flattening them would corrupt how the step's output is addressed downstream). Colliding structured keys are dropped with a debug-level log and stay reachable under `output.structured.<key>`.
+
+### Error Handling and `is_error` Routing
+
+Logical tool errors reported by the server set `output.is_error = True` and complete the step normally without raising an error, enabling conditional routing:
+
+```yaml
+routes:
+  - to: handle_error
+    when: "{{ output.is_error }}"
+  - to: next_step
+```
+
+Transport failures, unlisted tools, unknown servers, timeouts, and output schema validation failures raise exceptions and fail the step.
+
+### Concurrency and Server Serialization
+
+Calls to the same MCP server process are serialized via a per-server slot lock. Calls to distinct MCP servers in parallel groups run concurrently.
+
+### MCP Step Restrictions
+
+MCP agents **cannot** have: `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `settings_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
+
+MCP steps currently support `stdio` servers only.
+
 ## Sub-Workflow Agents (`type: workflow`)
 
 Reference an external workflow YAML file as a black-box step. The sub-workflow runs with its own engine and inherits the parent's provider configuration.
@@ -654,10 +712,10 @@ agents:
 **Semantics:**
 
 - Reaching a terminate step ends the workflow immediately — no routes evaluated after.
-- `status: success` → engine returns the rendered output, CLI exits `0`, dashboard ✅, emits `workflow_completed { termination_reason, terminated_by, is_explicit: true, status: "success" }`. Runs the `on_complete` hook.
-- `status: failed` → engine raises `WorkflowTerminated` (subclass of `ExecutionError`), CLI exits `1` (and still prints the rendered output JSON to stdout for downstream tooling), dashboard ❌, emits `workflow_failed { error_type: "WorkflowTerminated", termination_reason, terminated_by, is_explicit: true, status: "failed", output }`. Runs the `on_error` hook. **Intentionally not resumable** — the engine skips the on-failure checkpoint because the author explicitly chose this outcome.
+- `status: success` → engine returns the rendered output, CLI exits `0`, dashboard ✅, emits `workflow_completed { termination_reason, terminated_by, is_explicit: true, status: "success" }`.
+- `status: failed` → engine raises `WorkflowTerminated` (subclass of `ExecutionError`), CLI exits `1` (and still prints the rendered output JSON to stdout for downstream tooling), dashboard ❌, emits `workflow_failed { error_type: "WorkflowTerminated", termination_reason, terminated_by, is_explicit: true, status: "failed", output }`. **Intentionally not resumable** — the engine skips the on-failure checkpoint because the author explicitly chose this outcome.
 - `output_template:` is a `dict[str, str]` where each value is a Jinja2 expression. The rendered values are passed through the engine's JSON-coercion helper, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals (`'{"k":"v"}'`) are parsed. When omitted, the workflow-level `output:` mapping is rendered as on any other terminal path.
-- **Sub-workflow boundary** — a `status: failed` terminate inside a child sub-workflow is downgraded to `SubworkflowTerminatedError` (also an `ExecutionError`) at the parent boundary. The parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate-step name are preserved as `terminated_output` / `terminated_reason` / `terminated_by` attributes on the wrapper for `on_error` hooks and debugging surfaces. A `status: success` child terminate returns its rendered output cleanly and the parent continues with its next routes.
+- **Sub-workflow boundary** — a `status: failed` terminate inside a child sub-workflow is downgraded to `SubworkflowTerminatedError` (also an `ExecutionError`) at the parent boundary. The parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate-step name are preserved as `terminated_output` / `terminated_reason` / `terminated_by` attributes on the wrapper for debugging surfaces .A `status: success` child terminate returns its rendered output cleanly and the parent continues with its next routes.
 - **Branching on a child's termination** — if the parent's routes need to react to a child's outcome, the child should use `status: success` plus an `output_template:` carrying the relevant fields. Failed terminate is an error from the parent's perspective; parent `routes:` are only evaluated after successful steps.
 
 **Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot appear as a parallel-group member or as a `for_each` inline agent — route to them from those groups' `routes:` instead. Conversely, regular agents cannot have `status`, `reason`, or `output_template` — those fields are rejected at schema validation to catch authors who forgot to add `type: terminate`.
@@ -928,6 +986,20 @@ agents:
       - other_agent.output.nested.field  # Nested projection (deep path)
       - optional_agent.output?           # Optional (? suffix)
 ```
+
+### Context Compaction
+
+A single agent execution with a multi-turn tool loop (for example, many MCP tool calls returning large payloads) can grow the provider's message history until it approaches the model's context window. To prevent this, Conductor features automatic, always-on client-side context compaction for `claude` and `openai` providers. When the history size crosses a computed trigger threshold (based on context window and output limits), Conductor condenses the conversation:
+
+1.  **Clear Tool Results:** Older tool call and return pairs are truncated.
+2.  **Summarize History:** Older messages are replaced with a summary generated by a nested model call.
+3.  **Sliding Window:** Oldest messages are discarded as a final fallback.
+
+Compaction operates on the message history within a single agent execution. Loop-back routing does NOT accumulate provider history — each execution starts a fresh model session, so context `mode: accumulate` (which only accumulates *workflow* outputs across steps) is not a way to grow into the trigger. The feature matters for agents whose own tool loops are long.
+
+Each summarizing compaction step consumes one request slot from the agent's `max_agent_iterations` budget. If compaction is expected, ensure `max_agent_iterations` is set high enough (at least 5).
+
+No extra YAML configuration is required, and there is no user-facing context window override.
 
 ## Multi-Provider Workflows
 

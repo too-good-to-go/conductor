@@ -22,13 +22,17 @@ from __future__ import annotations
 
 import inspect
 import logging
+import os
 from typing import TYPE_CHECKING, Final, Literal
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
+from conductor.plugins.manifest import PluginFlavor
 from conductor.providers.reasoning import ReasoningEffort
+from conductor.telemetry import guards
 
 if TYPE_CHECKING:
+    from conductor.config.schema import ProviderSettings
     from conductor.providers.base import AgentProvider
 
 logger = logging.getLogger(__name__)
@@ -106,6 +110,10 @@ class ProviderCapabilities(BaseModel):
     """``True`` when the provider emits ``agent_message`` / ``agent_tool_*``
     events incrementally during execution (vs. only at completion)."""
 
+    native_otel_spans: bool = False
+    """``True`` when the provider's SDK emits OpenTelemetry spans for agent
+    operations, including tools, without Conductor creating duplicates."""
+
     agent_reasoning_events: bool
     """``True`` when the provider emits ``agent_reasoning`` events for
     thinking / chain-of-thought content."""
@@ -152,6 +160,22 @@ class ProviderCapabilities(BaseModel):
     provider with ``working_dir=False`` fail validation — silently ignoring
     the directory would run the agent in the wrong repository. Defaults to
     ``False`` (conservative)."""
+
+    settings_dir: bool = False
+    """``True`` when the provider applies an agent's resolved ``settings_dir``.
+
+    Workflows that set ``settings_dir`` against a provider with
+    ``settings_dir=False`` are refused twice -- by ``conductor validate`` and
+    again at run time by
+    :meth:`conductor.executor.agent.AgentExecutor._reject_unsupported_settings_dir`,
+    because ``conductor run`` never invokes the static validator. Both are
+    needed for the same reason: the field selects which repository's
+    conventions the agent loads *and* widens the model's built-in file tools
+    to that tree, so silently ignoring it would run the agent against the
+    wrong conventions while reporting success. Distinct from ``working_dir`` because the two are
+    deliberately independent axes -- cwd is the sole root a filesystem MCP
+    server gets, while this only adds a directory. Defaults to ``False``
+    (conservative)."""
 
     skills: bool = False
     """``True`` when the provider exposes :mod:`conductor.skills` content
@@ -200,8 +224,40 @@ class ProviderCapabilities(BaseModel):
     against a provider with ``plugins=False`` fail validation. Defaults
     to ``False``."""
 
+    plugin_flavor: PluginFlavor | None = None
+    """Which build a plugin-capable provider expects — see
+    :class:`conductor.plugins.manifest.PluginFlavor`.
+
+    Required (non-``None``) whenever :attr:`plugins` is ``True``, enforced
+    by the model validator below: a provider that can load plugins always
+    has an opinion about which build it wants, since ``copilot`` and
+    ``claude-agent-sdk`` read structurally different ``agents/`` file
+    conventions (see :mod:`conductor.plugins.agents`). ``None`` is only
+    valid alongside ``plugins=False``, where there is no flavor to have an
+    opinion about.
+
+    This governs *tie-breaking only* — which build wins when a genuine
+    choice exists (a dual-catalog marketplace, or an installed name shared
+    by one marketplace directory) — never whether a plugin can be read at
+    all. Parsing a plugin's ``agents/`` always follows the manifest
+    convention that actually matched
+    (:attr:`conductor.plugins.manifest.PluginManifest.flavor`), so a
+    provider handed the "wrong" build still gets every subagent that
+    build ships; issue #497 is exactly a provider that used to get none
+    of them because the candidate-file rule was hardcoded to one flavor
+    regardless of which convention the resolved plugin used."""
+
     session_continuity: bool = False
     """``True`` when the provider supports per-agent ``session_key``."""
+
+    idle_recovery: bool = False
+    """``True`` when the provider honors ``runtime.idle_timeout_seconds`` /
+    ``runtime.max_idle_recovery_attempts`` (#488). These are Copilot-only
+    tuning knobs for its SDK-event-driven idle watchdog; other providers
+    have no equivalent mechanism and silently ignore both fields. Unlike
+    ``max_session_seconds``, this is a tuning knob rather than a safety
+    bound, so a mismatch is a validate-time **warning**, not an error.
+    Defaults to ``False``."""
 
     max_temperature: float | None = None
     """Highest temperature the provider accepts.
@@ -247,6 +303,25 @@ class ProviderCapabilities(BaseModel):
             )
         return v
 
+    @model_validator(mode="after")
+    def _plugin_flavor_required_when_plugins_supported(self) -> ProviderCapabilities:
+        """A plugin-capable provider must declare which build it expects.
+
+        Catches the mistake a future plugin-capable provider could
+        otherwise make silently: declaring ``plugins=True`` without
+        picking a flavor would leave :func:`plugin_flavor_for` returning
+        ``None`` for it, which every caller treats as "no preference" —
+        exactly the untagged state that let issue #497 happen in the
+        first place, just moved from ``agents.py``'s hardcoded suffix to
+        a new provider's missing declaration.
+        """
+        if self.plugins and self.plugin_flavor is None:
+            raise ValueError(
+                "plugin_flavor is required when plugins=True — a plugin-capable "
+                "provider must declare which build (PluginFlavor) it expects."
+            )
+        return self
+
     def declared_limitations(self) -> list[str]:
         """Human-readable list of capability fields that read as ``false`` / ``None``.
 
@@ -285,6 +360,8 @@ class ProviderCapabilities(BaseModel):
             items.append("no skills support")
         if not self.session_continuity:
             items.append("no session_key continuity")
+        if not self.idle_recovery:
+            items.append("idle_timeout_seconds/max_idle_recovery_attempts ignored")
         return items
 
 
@@ -476,6 +553,55 @@ def uses_native_skills(provider_type: str) -> bool | None:
     return _resolve_static_flag(provider_type, "supports_native_skills")
 
 
+def has_native_otel_spans(provider_type: str) -> bool | None:
+    """Whether a provider's SDK emits the tool spans Conductor would duplicate.
+
+    Returns ``None`` when the provider cannot be resolved; callers retain
+    Conductor spans in that case.
+    """
+    try:
+        return get_capabilities(provider_type).native_otel_spans
+    except (AttributeError, ImportError, KeyError):
+        return None
+
+
+def native_otel_spans_active(
+    provider_name: str,
+    provider_settings: ProviderSettings | None,
+    *,
+    telemetry_protocol: str | None,
+) -> bool:
+    """Return whether the resolved provider can emit native OTEL spans for this run."""
+    # Native instrumentation is only ever wired when this run actually
+    # initialized tracing — a static capability alone says nothing about a
+    # run with no endpoint configured, tracing disabled, or a failed init.
+    # Keep the static answer in has_native_otel_spans(); this function is
+    # about the active run.
+    if not guards.is_telemetry_active():
+        return False
+    try:
+        native_otel_spans = get_capabilities(provider_name).native_otel_spans
+    except (AttributeError, ImportError, KeyError):
+        return False
+
+    if not native_otel_spans:
+        return False
+    if provider_name != "copilot":
+        return True
+    if telemetry_protocol not in {"http/protobuf", "http/json"}:
+        return False
+    if guards.current_otlp_endpoint() is None:
+        return False
+
+    settings = (
+        provider_settings
+        if provider_settings is not None and provider_settings.name == provider_name
+        else None
+    )
+    runtime_url = settings.runtime_url if settings is not None else None
+    return not (runtime_url or os.environ.get("COPILOT_PROVIDER_RUNTIME_URL"))
+
+
 def uses_native_plugins(provider_type: str) -> bool | None:
     """Whether a provider can register a plugin's subagents.
 
@@ -489,6 +615,27 @@ def uses_native_plugins(provider_type: str) -> bool | None:
         cannot be determined without constructing the provider.
     """
     return _resolve_static_flag(provider_type, "supports_native_plugins")
+
+
+def plugin_flavor_for(provider_type: str) -> PluginFlavor | None:
+    """Which plugin build a provider expects, resolved without instantiating.
+
+    Args:
+        provider_type: Provider name as it appears in workflow YAML.
+
+    Returns:
+        :attr:`ProviderCapabilities.plugin_flavor` for the resolved
+        provider, or ``None`` when the provider declares no plugin
+        support, is unknown, or its capabilities cannot be resolved
+        without constructing it (mirroring :func:`get_capabilities`'s
+        error modes, but returning ``None`` instead of raising — callers
+        here want a flavor to break a tie with, not a hard failure).
+    """
+    try:
+        capabilities = get_capabilities(provider_type)
+    except (KeyError, AttributeError):
+        return None
+    return capabilities.plugin_flavor
 
 
 def requires_plugin_root_for_skills(provider_type: str) -> bool | None:
@@ -513,7 +660,10 @@ __all__ = [
     "ReasoningEffortLevel",
     "StructuredOutputMode",
     "get_capabilities",
+    "has_native_otel_spans",
     "known_provider_names",
+    "native_otel_spans_active",
+    "plugin_flavor_for",
     "requires_plugin_root_for_skills",
     "uses_native_plugins",
     "uses_native_skills",

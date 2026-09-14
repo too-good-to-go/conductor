@@ -48,6 +48,7 @@ _CAPS = ProviderCapabilities(
     concurrent_safe=True,
     skills=True,
     plugins=True,
+    plugin_flavor="copilot",
 )
 
 
@@ -80,6 +81,7 @@ class _CapturingProvider(AgentProvider, abstract=True):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         self.skill_directories = skill_directories
         self.custom_agents = custom_agents
@@ -91,6 +93,12 @@ class _CapturingProvider(AgentProvider, abstract=True):
 
     async def close(self) -> None:
         return None
+
+
+class _ClaudeFlavorProvider(_CapturingProvider, abstract=True):
+    """Declares the Claude build's plugin flavor (issue #497)."""
+
+    CAPABILITIES = _CAPS.model_copy(update={"plugin_flavor": "claude"})
 
 
 def _config(
@@ -130,6 +138,14 @@ class _StubRegistry:
 
     async def get_provider(self, agent: object) -> AgentProvider:
         return self._provider
+
+    def provider_type_for(self, agent: object) -> str:
+        provider = getattr(agent, "provider", None)
+        return provider or "copilot"
+
+    def provider_settings_for(self, provider_type: object) -> None:
+        """The stub provider carries no structured runtime settings."""
+        return None
 
     async def close(self) -> None:
         return None
@@ -255,6 +271,29 @@ class TestBothEngineProviderModes:
             via_registry=via_registry,
         )
         assert provider.skill_directories == [str(tmp_path / "prs" / "skills" / "review")]
+        assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
+        assert list(provider.extra_mcp_servers or {}) == ["srv"]
+
+    def test_claude_built_plugin_subagents_reach_the_provider(
+        self, tmp_path: Path, via_registry: bool
+    ) -> None:
+        # Mirrors the executor-level regression test at the engine level
+        # (the ``_StubRegistry`` branch is the one ``conductor run`` uses).
+        make_plugin(
+            tmp_path / "prs",
+            "prs",
+            manifest=".claude-plugin",
+            agents=["code-reviewer"],
+            agent_suffix=".md",
+            mcp={"srv": {"type": "stdio", "command": "npx"}},
+        )
+        provider = _ClaudeFlavorProvider()
+        _run(
+            _config([PluginDef(name="./prs")]),
+            provider,
+            _workflow_file(tmp_path),
+            via_registry=via_registry,
+        )
         assert [spec["name"] for spec in provider.custom_agents or []] == ["prs:code-reviewer"]
         assert list(provider.extra_mcp_servers or {}) == ["srv"]
 

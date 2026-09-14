@@ -661,7 +661,7 @@ class SubworkflowTerminatedError(ExecutionError):
        explicit termination — the child did.
     2. The structured payload the child built (its rendered ``output_template``
        dict, the rendered reason, the terminate step's name) is preserved on
-       the wrapper so on_error hooks, debugging surfaces, and the CLI can
+       the wrapper so debugging surfaces and the CLI can
        inspect it without walking ``__cause__``.
 
     Attributes:

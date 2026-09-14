@@ -33,10 +33,6 @@ workflow:
     max_iterations: 20
     timeout_seconds: 300
   
-  hooks:
-    on_start: "{{ workflow.input.goal }}"
-    on_complete: "completed"
-    on_error: "error occurred"
 
 tools:
   - web_search

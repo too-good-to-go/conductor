@@ -360,25 +360,6 @@ class TestHandleDashboardStop:
         )
         assert not any(e.type == "checkpoint_saved" for e in events)
 
-    @pytest.mark.asyncio
-    async def test_runs_on_error_hook(self, tmp_path: Path) -> None:
-        """The on_error lifecycle hook runs on a dashboard stop (parity with the
-        in-loop ConductorError path)."""
-        wf_path = _write_workflow(tmp_path)
-        config = _multi_agent_config()
-        provider = CopilotProvider(mock_handler=lambda a, p, c: {"plan": "p"})
-        engine, _events = self._engine_with_emitter(config, provider, workflow_path=wf_path)
-        engine._current_agent_name = "researcher"
-
-        with (
-            patch.object(CheckpointManager, "get_checkpoints_dir", return_value=tmp_path),
-            patch.object(engine, "_execute_hook") as mock_hook,
-        ):
-            engine.handle_dashboard_stop("Workflow stopped by user via dashboard")
-
-        assert mock_hook.call_args is not None
-        assert mock_hook.call_args.args[0] == "on_error"
-
 
 # ---------------------------------------------------------------------------
 # Resume tests

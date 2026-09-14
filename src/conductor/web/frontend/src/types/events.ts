@@ -28,6 +28,9 @@ export type EventType =
   | 'set_started'
   | 'set_completed'
   | 'set_failed'
+  | 'mcp_started'
+  | 'mcp_completed'
+  | 'mcp_failed'
   | 'gate_presented'
   | 'gate_resolved'
   | 'questions_presented'
@@ -41,6 +44,7 @@ export type EventType =
   | 'parallel_completed'
   | 'for_each_started'
   | 'for_each_item_started'
+  | 'for_each_agent_started'
   | 'for_each_item_completed'
   | 'for_each_item_failed'
   | 'for_each_completed'
@@ -62,7 +66,10 @@ export type EventType =
   | 'iteration_limit_resolved'
   | 'budget_exceeded'
   | 'guidance_received'
-  | 'guidance_applied';
+  | 'guidance_applied'
+  | 'agent_compaction_config'
+  | 'agent_compaction_start'
+  | 'agent_compaction_complete';
 
 // --- Workflow lifecycle ---
 
@@ -202,6 +209,7 @@ export interface AgentPromptRenderedData {
   agent_name: string;
   rendered_prompt: string;
   context_keys?: string[];
+  continuation?: boolean;
 }
 
 export interface AgentReasoningData {
@@ -333,6 +341,42 @@ export interface SetFailedData {
   message?: string;
 }
 
+// --- MCP lifecycle ---
+
+export interface McpStartedData {
+  agent_name: string;
+  iteration?: number;
+  server: string;
+  tool: string;
+  argument_keys: string[];
+  group_name?: string;
+  item_key?: string;
+}
+
+export interface McpCompletedData {
+  agent_name: string;
+  elapsed?: number;
+  server: string;
+  tool: string;
+  is_error: boolean;
+  result_bytes: number;
+  truncated: boolean;
+  spill_path?: string;
+  group_name?: string;
+  item_key?: string;
+}
+
+export interface McpFailedData {
+  agent_name: string;
+  elapsed?: number;
+  server: string;
+  tool: string;
+  error_type?: string;
+  message?: string;
+  group_name?: string;
+  item_key?: string;
+}
+
 // --- Gate events ---
 
 export interface GateOptionDetail {
@@ -442,6 +486,14 @@ export interface ForEachItemStartedData {
   item_key: string;
   index: number;
   item?: unknown;
+}
+
+export interface ForEachAgentStartedData {
+  group_name: string;
+  agent_name: string;
+  item_key: string;
+  index: number;
+  working_dir: string | null;
 }
 
 export interface ForEachItemCompletedData {
@@ -563,6 +615,64 @@ export interface AgentValidationFailedData {
   /** True on the second emission, when the feedback re-run itself failed and
    *  the original (failing) output was kept. */
   rerun_errored?: boolean;
+  /** Why the feedback re-run failed ("TypeError: ..."); set with rerun_errored. */
+  error?: string;
+  /** Whether the re-run continued the provider-held conversation. */
+  continued?: boolean;
+}
+
+// --- Compaction events ---
+
+export interface AgentCompactionConfigData {
+  agent_name: string;
+  model: string;
+  context_window: number;
+  context_window_source: string;
+  output_limit: number;
+  output_limit_source: string;
+  /** False when compaction was disabled for this execution; trigger/target
+   *  are null in that case and disabled_reason says why. */
+  enabled?: boolean;
+  disabled_reason?: string | null;
+  tool_buffer?: number;
+  effective_tool_buffer?: number;
+  trigger_tokens: number | null;
+  target_tokens: number | null;
+}
+
+export interface AgentCompactionStartData {
+  agent_name: string;
+  strategy: string;
+  model: string;
+  context_window: number;
+  context_window_source: string;
+  output_limit: number;
+  output_limit_source: string;
+  trigger_tokens: number;
+  target_tokens: number;
+  messages_before?: number;
+  tokens_before?: number;
+}
+
+export interface AgentCompactionCompleteData {
+  agent_name: string;
+  strategy: string;
+  model: string;
+  context_window?: number;
+  context_window_source?: string;
+  messages_before?: number;
+  messages_after?: number;
+  tokens_before?: number;
+  tokens_after?: number;
+  tokens_saved?: number;
+  elapsed?: number;
+  errored: boolean;
+  error_type?: string;
+  message?: string;
+  /** Tiers that degraded to a weaker strategy during this compaction. */
+  degraded_tiers?: string[];
+  /** True when the post-compaction size still exceeds the trigger. */
+  still_over_trigger?: boolean;
 }
 
 // --- Subworkflow lifecycle ---

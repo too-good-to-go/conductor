@@ -222,6 +222,31 @@ agents:
         assert config.workflow.name == "string-test"
         assert len(config.agents) == 1
 
+    def test_hooks_block_is_rejected_with_removal_message(self) -> None:
+        """A workflow declaring the removed `hooks:` block fails to load with
+        a message naming the removal (#476), not a generic schema error.
+
+        This is the path an upgrading user actually hits — a `hooks:` block
+        that used to load (and silently no-op) now aborts the load."""
+        yaml_content = """
+workflow:
+  name: hooks-test
+  entry_point: agent1
+  hooks:
+    on_start: "starting"
+agents:
+  - name: agent1
+    model: gpt-4
+    prompt: "Hello"
+    routes:
+      - to: $end
+"""
+        with pytest.raises(ConfigurationError) as exc_info:
+            load_config_string(yaml_content)
+        message = str(exc_info.value)
+        assert "hooks" in message
+        assert "#476" in message
+
 
 class TestConfigLoaderEdgeCases:
     """Tests for edge cases in config loading."""

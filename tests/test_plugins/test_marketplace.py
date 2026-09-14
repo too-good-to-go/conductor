@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -290,3 +291,142 @@ class TestManifestPrecedence:
         make_marketplace(tmp_path, "acme", {}, manifest=convention)
 
         assert find_marketplace_manifest(tmp_path) == tmp_path / convention / "marketplace.json"
+
+
+class TestDualCatalogFlavorResolution:
+    """A repository shipping both catalog conventions, mirroring the real
+    dual-build marketplace verified for issue #497: each catalog points at
+    its own build directory, and ``flavor=`` picks between them."""
+
+    def _build(self, tmp_path: Path):
+        make_plugin(tmp_path / "dist" / "claude" / "prs", "prs")
+        make_plugin(tmp_path / "dist" / "copilot" / "prs", "prs", manifest=".github/plugin")
+        make_marketplace(
+            tmp_path,
+            "acme",
+            {"prs": "./dist/claude/prs"},
+            manifest=".claude-plugin",
+            plugin_root="./dist/claude",
+        )
+        make_marketplace(
+            tmp_path,
+            "acme",
+            {"prs": "./prs"},
+            manifest=".github/plugin",
+            plugin_root="./dist/copilot",
+        )
+
+    def test_flavored_tables_are_populated(self, tmp_path: Path):
+        self._build(tmp_path)
+
+        marketplace = read_marketplace(tmp_path, name="acme")
+
+        assert marketplace.flavored["claude"] == {"prs": tmp_path / "dist" / "claude" / "prs"}
+        assert marketplace.flavored["copilot"] == {"prs": tmp_path / "dist" / "copilot" / "prs"}
+
+    def test_resolve_picks_the_claude_build(self, tmp_path: Path):
+        self._build(tmp_path)
+
+        marketplace = read_marketplace(tmp_path, name="acme")
+
+        assert marketplace.resolve("prs", flavor="claude") == tmp_path / "dist" / "claude" / "prs"
+
+    def test_resolve_picks_the_copilot_build(self, tmp_path: Path):
+        self._build(tmp_path)
+
+        marketplace = read_marketplace(tmp_path, name="acme")
+
+        assert marketplace.resolve("prs", flavor="copilot") == tmp_path / "dist" / "copilot" / "prs"
+
+    def test_unflavored_resolve_keeps_the_claude_first_default(self, tmp_path: Path):
+        self._build(tmp_path)
+
+        marketplace = read_marketplace(tmp_path, name="acme")
+
+        assert marketplace.resolve("prs") == tmp_path / "dist" / "claude" / "prs"
+        assert marketplace.plugins == {"prs": tmp_path / "dist" / "claude" / "prs"}
+
+    def test_single_catalog_marketplace_never_warns_on_a_flavor_mismatch(
+        self, tmp_path: Path
+    ) -> None:
+        # Only one build exists at all, so using it is not a "fallback" —
+        # there was never a genuine choice to have gotten wrong.
+        make_plugin(tmp_path / "prs", "prs")
+        make_marketplace(tmp_path, "acme", {"prs": "./prs"})
+
+        marketplace = read_marketplace(tmp_path, name="acme")
+        warnings: list[str] = []
+        root = marketplace.resolve("prs", flavor="copilot", on_warning=warnings.append)
+
+        assert root == tmp_path / "prs"
+        assert warnings == []
+
+    def test_dual_catalog_missing_flavor_table_warns_and_falls_back(self, tmp_path: Path) -> None:
+        self._build(tmp_path)
+        # Delete the Copilot build so its catalog entry cannot resolve,
+        # leaving only the Claude flavor populated.
+        shutil.rmtree(tmp_path / "dist" / "copilot")
+
+        marketplace = read_marketplace(tmp_path, name="acme")
+        assert marketplace.flavored["copilot"] == {}
+        warnings: list[str] = []
+        root = marketplace.resolve("prs", flavor="copilot", on_warning=warnings.append)
+
+        assert root == tmp_path / "dist" / "claude" / "prs"
+        assert any("no 'copilot'-flavored build" in message for message in warnings)
+
+    def test_a_secondary_catalog_that_cannot_be_read_does_not_fail_the_marketplace(
+        self, tmp_path: Path
+    ) -> None:
+        # A repository with a valid primary (Claude) catalog and a broken
+        # secondary (Copilot) one used to hard-fail the whole marketplace —
+        # a strict regression against `main`, which only ever read the
+        # first match. The secondary convention must be best-effort.
+        self._build(tmp_path)
+        (tmp_path / ".github" / "plugin" / "marketplace.json").write_text(
+            "not json", encoding="utf-8"
+        )
+
+        marketplace = read_marketplace(tmp_path, name="acme")
+
+        assert marketplace.plugins == {"prs": tmp_path / "dist" / "claude" / "prs"}
+        assert "copilot" not in marketplace.flavored
+
+    def test_plugin_key_narrowing_preserves_the_multi_flavor_signal(self, tmp_path: Path) -> None:
+        # A plugin published in only one of two catalogs must not make
+        # `plugin:` narrowing collapse `flavored` to a single key — that
+        # silently suppressed the flavor-fallback warning below (issue
+        # #497's own failure mode recurring inside its fix).
+        self._build(tmp_path)
+        shutil.rmtree(tmp_path / "dist" / "copilot")
+
+        marketplace = read_marketplace(tmp_path, name="acme", plugin="prs")
+
+        assert marketplace.flavored["copilot"] == {}
+        warnings: list[str] = []
+        root = marketplace.resolve("prs", flavor="copilot", on_warning=warnings.append)
+        assert root == tmp_path / "dist" / "claude" / "prs"
+        assert any("no 'copilot'-flavored build" in message for message in warnings)
+
+    def test_plugin_key_narrowing_finds_a_plugin_published_only_in_the_secondary_catalog(
+        self, tmp_path: Path
+    ) -> None:
+        # `resolved.resolve(plugin)` with no flavor only ever consults the
+        # primary (Claude-first) table, so a plugin listed only in the
+        # Copilot catalog was unreachable through the narrowed marketplace
+        # even though its own `flavored` table held a perfectly good entry.
+        make_plugin(tmp_path / "dist" / "copilot" / "solo", "solo", manifest=".github/plugin")
+        make_marketplace(
+            tmp_path, "acme", {}, manifest=".claude-plugin", plugin_root="./dist/claude"
+        )
+        make_marketplace(
+            tmp_path,
+            "acme",
+            {"solo": "./solo"},
+            manifest=".github/plugin",
+            plugin_root="./dist/copilot",
+        )
+
+        marketplace = read_marketplace(tmp_path, name="acme", plugin="solo")
+
+        assert marketplace.plugins == {"solo": tmp_path / "dist" / "copilot" / "solo"}

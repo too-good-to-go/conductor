@@ -58,6 +58,7 @@ class _CapturingProvider(AgentProvider, abstract=True):
         skill_directories: list[str] | None = None,
         custom_agents: list[dict[str, Any]] | None = None,
         extra_mcp_servers: dict[str, Any] | None = None,
+        continuation_state: Any = None,
     ) -> AgentOutput:
         self.skill_directories = skill_directories
         self.rendered_prompt = rendered_prompt
@@ -206,6 +207,13 @@ class _StubRegistry:
 
     async def get_provider(self, agent: AgentDef) -> AgentProvider:
         return self._provider
+
+    def provider_type_for(self, agent: AgentDef) -> str:
+        return agent.provider or "copilot"
+
+    def provider_settings_for(self, provider_type: object) -> None:
+        """The stub provider carries no structured runtime settings."""
+        return None
 
     def get_active_providers(self) -> dict[str, AgentProvider]:
         return {"copilot": self._provider}
